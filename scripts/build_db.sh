@@ -55,6 +55,15 @@ function cmd () {
   $@
 }
 
+# useful for staged builds -- will stop execution of the build pipeline if
+# STOP_AFTER is set to a given value
+check_stop () {
+  if [[ ! -z "$KRAKEN_STOP_AFTER" && "$KRAKEN_STOP_AFTER" = "$1" ]]; then
+    echo "Stopping after $1 as requested"
+    exit 0
+  fi
+}
+
 
 start_time=$(date "+%s.%N")
 script_dir=`dirname $0`
@@ -94,15 +103,15 @@ TAXONOMY_DIR="taxonomy/"
 
 if [ ! -s "library-files.txt" ]; then
     echo "Finding all library files"
-    find $FIND_OPTS $LIBRARY_DIR '(' -iname '*.fna' -o -iname '*.fa' -o -iname '*.ffn' -o -iname '*.fasta' -o -iname '*.fsa' ')' > library-files.txt
+    find $FIND_OPTS $LIBRARY_DIR '(' -iname '*.fna' -o -iname '*.fa' -o -iname '*.ffn' -o -iname '*.fasta' -o -iname '*.fsa' -o -iname '*.fa.gz' -o -iname '*.fasta.gz' -o -iname '*.fsa.gz' -o -iname '*.fna.gz' ')' > library-files.txt
 fi
 
 cat_library() {
-  cat library-files.txt | tr '\n' '\0' | xargs -0 cat
+  cat library-files.txt | tr '\n' '\0' | xargs -0 zcat -f
 }
 
 cat_libraryp() {
-  find $FIND_OPTS $LIBRARY_DIR/{$@,} '(' -iname '*.fna' -o -iname '*.fa' -o -iname '*.ffn' -o -iname '*.fasta' -o -iname '*.fsa' ')' | tr '\n' '\0' | xargs -0 cat
+  find $FIND_OPTS $LIBRARY_DIR/{$@,} '(' -iname '*.fna' -o -iname '*.fa' -o -iname '*.ffn' -o -iname '*.fasta' -o -iname '*.fsa' -o -iname '*.fa.gz' -o -iname '*.fasta.gz' -o -iname '*.fsa.gz' -o -iname '*.fna.gz' ')' | tr '\n' '\0' | xargs -0 zcat -f
 }
 
 N_FILES=`cat library-files.txt | wc -l`
@@ -116,6 +125,7 @@ echo "Found $N_FILES sequence files (*.{fna,fa,ffn,fasta,fsa}) in the library di
 if [ -e "database.jdb" ] || [ -e "database0.kdb" ]
 then
   echo "Skipping step 1, k-mer set already exists."
+  check_stop "count"
 else
   echo "Creating k-mer set (step 1 of 6)..."
   start_time1=$(date "+%s.%N")
@@ -130,6 +140,8 @@ else
 
   exe eval $JELLYFISH_BIN count -m $KRAKEN_KMER_LEN -s $KRAKEN_HASH_SIZE -C -t $KRAKEN_THREAD_CT \
     -o database <( cat_library )
+
+  check_stop "count"
 
   # Merge only if necessary
   if [ -s "database_1" ]
@@ -146,6 +158,8 @@ else
   fi
   echo "K-mer set created. [$(report_time_elapsed $start_time1)]"
 fi
+
+check_stop "merge"
 
 if [ -z "$KRAKEN_MAX_DB_SIZE" ]
 then
@@ -191,6 +205,8 @@ else
   fi
 fi
 
+check_stop "shrink"
+
 SORTED_DB_NAME=database0.kdb
 if [ -e "$SORTED_DB_NAME" ]
 then
@@ -207,6 +223,8 @@ else
 
   echo "K-mer set sorted. [$(report_time_elapsed $start_time1)]"
 fi
+
+check_stop "sort"
 
 if [ -s "seqid2taxid.map" ]
 then
@@ -240,6 +258,8 @@ else
   echo "taxDB construction finished. [$(report_time_elapsed $start_time1)]"
 fi
 
+check_stop "tax"
+
 if [ "$KRAKEN_LCA_DATABASE" != "0" ]; then
   if [ -s "database.kdb" ] && [ "$KRAKEN_RESET_TAXIDS" != "1" ]
   then
@@ -267,7 +287,7 @@ if [ "$KRAKEN_LCA_DATABASE" != "0" ]; then
     fi
 
 	[[ -z "${KRAKEN_LCA_ORDER}" ]] && DC="-c database.kdb.counts" || DC=""
-    set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx -v \
+    set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx \
         -b taxDB $PARAM $PARAM1 -t $KRAKEN_THREAD_CT -m seqid2taxid.map $DC \
         -F <( cat_library ) -T > seqid2taxid-plus.map
     if [ "$KRAKEN_ADD_TAXIDS_FOR_SEQ" == "1" ] || [ "$KRAKEN_ADD_TAXIDS_FOR_GENOME" == "1" ]; then
@@ -286,12 +306,12 @@ if [ "$KRAKEN_LCA_DATABASE" != "0" ]; then
         echo " Setting LCAs for $DDIR (substep 6.$COUNTER of 6.$TOTAL) ..."
 	    [[ $COUNTER -eq $TOTAL ]] && DC="-c database.kdb.counts" || DC=""
 		  ## First reset all taxids that appear in the set to zero (flag -R)
-        exe eval set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx -v \
+        exe eval set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx \
           -b taxDB $PARAM1 -t $KRAKEN_THREAD_CT -m seqid2taxid.map \
           -F <( cat_libraryp $DDIR ) -TR
 
 		  ## Then just re-set them
-        exe eval set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx -v \
+        exe eval set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -o database.kdb -i database.idx \
           -b taxDB $PARAM1 -t $KRAKEN_THREAD_CT -m seqid2taxid.map $DC \
           -F <( cat_libraryp $DDIR ) -T
 
@@ -312,6 +332,7 @@ if [ "$KRAKEN_LCA_DATABASE" != "0" ]; then
   fi
 fi
 
+check_stop "set_lcas"
 
 if [ "$KRAKEN_UID_DATABASE" != "0" ]; then
   if [ -s "uid_database.kdb" ]
@@ -331,7 +352,7 @@ if [ "$KRAKEN_UID_DATABASE" != "0" ]; then
       fi
     fi
     start_time1=$(date "+%s.%N")
-      set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -I uid_to_taxid.map -o uid_database.kdb -i database.idx -v \
+      set_lcas $MEMFLAG -x -d $SORTED_DB_NAME -I uid_to_taxid.map -o uid_database.kdb -i database.idx \
         -b taxDB $PARAM -t $KRAKEN_THREAD_CT -m seqid2taxid.map -c uid_database.kdb.counts -F <( cat_library )
   
     echo "UID Database created. [$(report_time_elapsed $start_time1)]"
