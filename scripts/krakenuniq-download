@@ -45,7 +45,7 @@ my @ALL_ASSEMBLY_LEVELS=qw/Complete_Genome Chromosome Scaffold Contig/;
 my @SMALL_GENOMES=qw/mitochondrion plasmid plastid/;
 
 my $FILTER_NT_SCRIPT = "$FindBin::RealBin/krakenuniq-filter_nt";
-my $BLAST_DL_SCRIPT = "$FindBin::RealBin/dl_blast.pl";
+my $BLAST_DL_SCRIPT = "$FindBin::RealBin/dl_blast";
 
 ## Option parsing
 my $DATABASE="refseq";
