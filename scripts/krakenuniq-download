@@ -905,9 +905,9 @@ sub download_from_blast(@) {
   my $fa_file = "$BASE_DIR/$DB.fna";
   my @cmd = (
     $BLAST_DL_SCRIPT,
-    'db' => $DB,
-    'fasta' => "$fa_file",
-    'tax_map' => "$fa_file.map",
+    '--db' => $DB,
+    '--fasta' => "$fa_file",
+    '--tax_map' => "$fa_file.map",
   );
   push @cmd, '--quiet'
     if (! $VERBOSE);

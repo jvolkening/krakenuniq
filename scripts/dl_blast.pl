@@ -21,6 +21,12 @@ use constant INFO => 'INFO';
 
 my $TAR = can_run('tar')
     // plog( ERROR, 'setup', "'tar' is required but not found\n" );
+my $BLDBCMD = can_run('blastdbcmd') // plog(
+    ERROR,
+    'setup',
+    "'blastdbcmd' is required but not found"
+    . " (perhaps you forgot to install BLAST?)"
+);
 
 my $base_url = 'https://ftp.ncbi.nih.gov/blast/db';
 
@@ -234,8 +240,10 @@ sub fetch_meta {
     my $scratch = File::Temp->newdir(CLEANUP => 1);
     my $ua = File::Fetch->new(uri => "$base_url/$fn");
     my $where = $ua->fetch(to => $scratch)
-        or plog( ERROR, 'setup', sprintf(
-            "Error downloading metadata file: %s", $ua->error)
+        or plog(
+            ERROR,
+            'setup',
+            "Error downloading metadata for $db: is this a valid database?"
         );
     local $/ = undef;
     open my $in, '<', $where;
