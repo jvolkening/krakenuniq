@@ -36,12 +36,14 @@ my $dir_blast;
 my $fo_taxmap;
 my $quiet = 0;
 my $gzip = 0;
+my $tmpdir;
 
 GetOptions(
     'db=s' => \$db,
     'dir_out=s' => \$dir_blast,
     'tax_map=s' => \$fo_taxmap,
     'fasta=s' => \$fo_fasta,
+    'tmpdir=s' => \$tmpdir,
     'gzip' => \$gzip,
     'quiet' => \$quiet,
 );
@@ -53,6 +55,7 @@ $dir_blast = abs_path($dir_blast)
 $fo_taxmap = abs_path($fo_taxmap)
     if (defined $fo_taxmap);
 
+$tmpdir //= $ENV{TMPDIR} // '/tmp';
 my $meta = fetch_meta(
     $db
 );
@@ -60,7 +63,7 @@ plog( ERROR, 'setup', "DB name mismatch in fetched metadata\n" )
     if ($db ne $meta->{dbname});
 my $expected_size = $meta->{'bytes-total'};
 
-my $staging = File::Temp->newdir(CLEANUP => 1);
+my $staging = File::Temp->newdir(DIR => $tmpdir, CLEANUP => 1);
 my $n_files = scalar @{ $meta->{files} };
 my $n_downloaded = 0;
 for my $fn (@{ $meta->{files} }) {
@@ -237,7 +240,7 @@ sub fetch_meta {
 
     plog( INFO, 'setup', "Fetching metadata for database: $db" );
     my $fn = "$db-nucl-metadata.json";
-    my $scratch = File::Temp->newdir(CLEANUP => 1);
+    my $scratch = File::Temp->newdir(DIR => $tmpdir, CLEANUP => 1);
     my $ua = File::Fetch->new(uri => "$base_url/$fn");
     my $where = $ua->fetch(to => $scratch)
         or plog(
