@@ -151,7 +151,8 @@ krakenuniq-download --db DBDIR <PATTERN>
      'taxonomy'         NCBI taxonomy mappings from ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/
      'nucleotide'       Download nucleotide sequences using a query specified using --search or --ac.
      'microbial-nt'     Download microbial sequences from nt database.
-     'nt'               Download sequences from nt database, specified via --taxa.
+     'nt'               Download sequences from nt database, filtered via --taxa.
+     'blast:XXX'        Download sequences from any NCBI BLAST database (XXX), filtered via --taxa.
      'viral-neighbors'  Download viral strain sequences from the NCBI Viral Genome Resource.
                         (Search: \"$vir_nbr_search_term\").
      'genbank/DOMAIN'   Download all complete genomes for DOMAIN from GenBank.
@@ -178,6 +179,9 @@ krakenuniq-download --db DBDIR refseq/viral/Any viral-neighbors
 
 ## Download all microbial (including eukaryotes) sequences in the NCBI nt database
 krakenuniq-download --db DBDIR --dust microbial-nt
+
+## Download all microbial (including eukaryotes) sequences in the NCBI core_nt database
+krakenuniq-download --db DBDIR --dust blast:core_nt
 ```
 
 To build the database indices on the downloaded files, run `krakenuniq-build --db DBDIR`.  To build a database with a *k*-mer length of 31 (the default), adding virtual taxonomy nodes for genomes and sequences (off by default), run `krakenuniq-build` with the following parameters:
