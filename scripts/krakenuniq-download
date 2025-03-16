@@ -907,7 +907,6 @@ sub download_from_blast(@) {
     $BLAST_DL_SCRIPT,
     '--db' => $DB,
     '--fasta' => "$fa_file",
-    '--tax_map' => "$fa_file.map",
     '--tmpdir' => $BASE_DIR,
   );
   my @tax_maps = download_maps($TAX_DIR, "nucl_gb", "nucl_wgs");
