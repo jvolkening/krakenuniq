@@ -2,6 +2,7 @@
 
 # krakenuniq-download.pl - based on centrifuge-download
 # (c) Florian Breitwieser, 2017-2019
+# updates 2025 Jeremy Volkening
 # licensed under GPL-3
 
 use strict;
@@ -16,7 +17,6 @@ use autodie;
 use Term::ANSIColor;
 use Getopt::Long;
 use LWP::Simple;
-#use LWP::UserAgent;
 use List::Util qw/min/;
 use FindBin;
 use Time::HiRes qw/usleep/;
@@ -25,8 +25,8 @@ use File::SortedSeek qw/alphabetic/;
 
 sub download_taxonomy(@);
 sub download_contaminats(@);
-sub download_nt(@);
 sub download(@);
+sub download_from_blast(@);
 sub dustmasked_file(@);
 sub dustmasked_file_exists(@);
 sub create_map_files(@);
@@ -45,6 +45,7 @@ my @ALL_ASSEMBLY_LEVELS=qw/Complete_Genome Chromosome Scaffold Contig/;
 my @SMALL_GENOMES=qw/mitochondrion plasmid plastid/;
 
 my $FILTER_NT_SCRIPT = "$FindBin::RealBin/krakenuniq-filter_nt";
+my $BLAST_DL_SCRIPT = "$FindBin::RealBin/dl_blast.pl";
 
 ## Option parsing
 my $DATABASE="refseq";
@@ -72,7 +73,6 @@ my $DL_MOD_RSYNC;
 my $n_children = 0;
 my $NUC_AC;
 my $EXCLUDE_ENVIRONMENTAL_TAXIDS = 0;
-my $NT_FNA_FILE=undef;
 my %taxid_name_map;
 my @pids;
 
@@ -150,7 +150,8 @@ ARGUMENTS
      'taxonomy'         NCBI taxonomy mappings from ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/
      'nucleotide'       Download nucleotide sequences using a query specified using --search or --ac.
      'microbial-nt'     Download microbial sequences from nt database.
-     'nt'               Download sequences from nt database, specified via --taxa, specified via --taxa.
+     'nt'               Download sequences from nt database, filtered via --taxa.
+     'blast:XXX'        Download sequences from any NCBI BLAST database (XXX), filtered via --taxa.
      'viral-neighbors'  Download viral strain sequences from the NCBI Viral Genome Resource.
                         (Search: \"$vir_nbr_search_term\").
      'genbank/DOMAIN'   Download all complete genomes for DOMAIN from GenBank.
@@ -220,7 +221,6 @@ GetOptions(
   "ac=s" => \$NUC_AC,
   "mapping-file=s" => \$MAP_DIV,
   "taxa=s" => \$TAXIDS_OR_DIVISIONS,
-  "nt-fna=s" => \$NT_FNA_FILE,
   "exclude-environmental-taxa" => \$EXCLUDE_ENVIRONMENTAL_TAXIDS,
   "dust|D" => \$DO_DUST,
   "change-header|l" => \$CHANGE_HEADER,
@@ -303,10 +303,23 @@ foreach my $DATABASE (@ARGV) {
     if (defined $SEARCH_TERM) {
       download_ncbi_search($nbr_dir, $ncbi_db, $SEARCH_TERM, get_sorted_maps($MAP_DIV));
     }
-  } elsif ($DATABASE eq 'nt' || $DATABASE eq 'microbial-nt') {
+  } elsif (
+    $DATABASE eq 'nt'
+    || $DATABASE eq 'microbial-nt'
+    || $DATABASE =~ /^blast:\S+$/
+  ) {
     download_taxonomy(get_dir($BASE_DIR,"taxonomy"));
-    download_nt($BASE_DIR, get_dir($BASE_DIR,"taxonomy"), get_dir($BASE_DIR,"library"));
-
+    # for the sake of backward compatability, accept 'nt' and 'microbial-nt'
+    # as plain arguments in addition to e.g. blast:nt and blast:microbial-nt
+    my $db = $DATABASE eq 'nt' || $DATABASE eq 'microbial-nt'
+      ? 'nt'
+      : substr($DATABASE, 6);
+    download_from_blast(
+      $db,
+      $BASE_DIR,
+      get_dir($BASE_DIR,"taxonomy"),
+      get_dir($BASE_DIR,"library"),
+    );
   } else {
     print STDERR "Unknown database $DATABASE. \n";
     print STDERR $USAGE;
@@ -886,23 +899,35 @@ sub create_map_file_ac(@) {
   close($F);
 }
 
-sub download_nt(@) {
-  my ($BASE_DIR, $TAX_DIR, $LIB_DIR) = @_;
-	my $nt_loc = "https://ftp.ncbi.nih.gov/blast/db/FASTA/nt.gz";
-  download($nt_loc, "$BASE_DIR/nt.fna.gz", { gunzip => 1, verbose => 1, 'dont-unlink-gz-file' => 1 } );
-  my $nt_file = "$BASE_DIR/nt.fna";
+sub download_from_blast(@) {
+
+  my ($DB, $BASE_DIR, $TAX_DIR, $LIB_DIR) = @_;
+  my $fa_file = "$BASE_DIR/$DB.fna";
+  my @cmd = (
+    $BLAST_DL_SCRIPT,
+    'db' => $DB,
+    'fasta' => "$fa_file",
+    'tax_map' => "$fa_file.map",
+  );
+  push @cmd, '--quiet'
+    if (! $VERBOSE);
   my @tax_maps = download_maps($TAX_DIR, "nucl_gb", "nucl_wgs");
 
-  my ($ac_index_for_nt, $child_map, $env_taxIDs, $division_taxIDs, $taxid_to_acs);
+  make_path(dirname($fa_file)) unless -d dirname($fa_file);
+  my $ret = system @cmd;
+  die "Download of $DB failed, aborting\n"
+    if ($ret);
+
+  my ($ac_index_for_fa, $child_map, $env_taxIDs, $division_taxIDs, $taxid_to_acs);
   my $do_filter = 0;
   my %selected_taxa;
   my %all_taxa;
 
   foreach my $taxid_or_division (split(/,/, $TAXIDS_OR_DIVISIONS)) {
-    my $microbial_nt_file = "$LIB_DIR/nt-$taxid_or_division.fna";
-    if (!-s $microbial_nt_file && !dustmasked_file_exists($microbial_nt_file)) {
+    my $microbial_fa_file = "$LIB_DIR/$DB-$taxid_or_division.fna";
+    if (!-s $microbial_fa_file && !dustmasked_file_exists($microbial_fa_file)) {
       if (!$do_filter) {
-        $ac_index_for_nt = get_nt_ac_index($nt_file);
+        $ac_index_for_fa = get_fa_ac_index($fa_file);
         $child_map = read_child_map("$TAX_DIR/nodes.dmp");
         $env_taxIDs = get_environmental_samples_taxids("$TAX_DIR/names.dmp") if $EXCLUDE_ENVIRONMENTAL_TAXIDS;
       }
@@ -912,27 +937,21 @@ sub download_nt(@) {
       $all_taxa{$_} = 1 foreach (keys %$accepted_taxa);
     }
   }
-  #print "\nALL_TAXA:\n"; foreach ((keys %all_taxa)[0..5]) { print "$_ => $all_taxa{$_}\n"; }; 
-  #print "\nNT_INDEX\n"; foreach ((keys %$ac_index_for_nt)[0..5]) { print "$_ => $ac_index_for_nt->{$_}\n"; }; 
-  #print "\nCHILD_MAP\n"; foreach ((keys %$child_map)[0..5]) { print "$_ => @{$child_map->{$_}}\n"; }; 
-  #print "\nENV_TAXIDs\n"; foreach ((keys %$env_taxIDs)[0..5]) { print "$_ => $env_taxIDs->{$_}\n"; }; 
-  #print STDERR "Got ",scalar(keys %all_taxa)," taxa.\n";
   if ($do_filter) {
-    $taxid_to_acs = get_tax_mappings(\@tax_maps, \%all_taxa, $ac_index_for_nt);
+    $taxid_to_acs = get_tax_mappings(\@tax_maps, \%all_taxa, $ac_index_for_fa);
   }
-  #print "\nTAXID_TO_ACS\n"; foreach ((keys %$taxid_to_acs)[0..5]) { print "$_ => $taxid_to_acs->{$_}\n"; }; 
 
-  open (my $NT, "<", $nt_file) or die $!;
+  open (my $FA, "<", $fa_file) or die $!;
   foreach my $taxid_or_division (split(/,/, $TAXIDS_OR_DIVISIONS)) {
-    my $microbial_nt_file = "$LIB_DIR/nt-$taxid_or_division.fna";
-    if (!-s $microbial_nt_file && !dustmasked_file_exists($microbial_nt_file)) {
-      write_filtered_nt($NT, $selected_taxa{$taxid_or_division}, $taxid_to_acs, $ac_index_for_nt, $microbial_nt_file);
+    my $microbial_fa_file = "$LIB_DIR/$DB-$taxid_or_division.fna";
+    if (!-s $microbial_fa_file && !dustmasked_file_exists($microbial_fa_file)) {
+      write_filtered_fa($FA, $selected_taxa{$taxid_or_division}, $taxid_to_acs, $ac_index_for_fa, $microbial_fa_file);
 
     }
-    check_file($microbial_nt_file) if -s $microbial_nt_file;
-    dustmask($microbial_nt_file, dustmasked_file($microbial_nt_file), {unlink=>1, verbose=>1}) if $DO_DUST;
+    check_file($microbial_fa_file) if -s $microbial_fa_file;
+    dustmask($microbial_fa_file, dustmasked_file($microbial_fa_file), {unlink=>1, verbose=>1}) if $DO_DUST;
   }
-  close $NT;
+  close $FA;
 }
 
 sub get_accepted_taxa {
@@ -944,7 +963,7 @@ sub get_accepted_taxa {
   } elsif (defined $division_to_taxids{$taxid_or_division})  {
     @taxIDs = @{$division_to_taxids{$taxid_or_division}};
   } else {
-    die "Don't know nt division '$taxid_or_division'. Chose one of ".(join(" ", sort keys %division_to_taxids))." or a specific taxID ('taxID12345')\n";
+    die "Don't know division '$taxid_or_division'. Chose one of ".(join(" ", sort keys %division_to_taxids))." or a specific taxID ('taxID12345')\n";
   }
   my %accepted_taxa;
   foreach my $taxID (@taxIDs) {
@@ -953,9 +972,9 @@ sub get_accepted_taxa {
   return \%accepted_taxa;
 }
 
-sub write_filtered_nt {
-  my ($NT, $accepted_taxa, $taxid_to_ac, $ac_to_pos, $new_nt) = @_;
-  open (my $NEWNT, ">", $new_nt) or die $!;
+sub write_filtered_fa {
+  my ($FA, $accepted_taxa, $taxid_to_ac, $ac_to_pos, $new_nt) = @_;
+  open (my $NEWFA, ">", $new_nt) or die $!;
   open (my $MAP_F, ">", "$new_nt.map") or die $!;
 
   print STDERR "Writing $new_nt ... ";
@@ -967,17 +986,17 @@ sub write_filtered_nt {
     ++$n_taxa;
     foreach my $ac (@{$taxid_to_ac->{$taxid}}) {
       ++$n_acs;
-      seek($NT, $ac_to_pos->{$ac}, 0);
-      $line = <$NT>;
-      print $NEWNT $line;
+      seek($FA, $ac_to_pos->{$ac}, 0);
+      $line = <$FA>;
+      print $NEWFA $line;
       print $MAP_F $ac,"\t",$taxid,"\n";
-      while ($line = <$NT>) {
+      while ($line = <$FA>) {
         last if ($line =~ /^>/);
-        print $NEWNT $line;
+        print $NEWFA $line;
       }
     }
   }
-  close $NEWNT;
+  close $NEWFA;
   close $MAP_F;
   print STDERR "Done, wrote $n_acs sequences for $n_taxa taxa (took ",elapsed_time($t0),").\n";
 }
@@ -1017,12 +1036,12 @@ sub get_environmental_samples_taxids {
   return \%env_taxIDs;
 }
 
-sub get_nt_ac_index {
-  my ($nt_file) = @_;
+sub get_fa_ac_index {
+  my ($fa_file) = @_;
   my %ac_to_pos;
   print STDERR "Reading headers from nt file ... ";
   my $t0 = time;
-  open (my $NTG, "-|", "grep --byte-offset '^>' $nt_file");
+  open (my $NTG, "-|", "grep --byte-offset '^>' $fa_file");
   while (my $line = <$NTG>) {
     $line =~ /^([0-9]*):>([^ ]*)/;
     # record the position of this AC
