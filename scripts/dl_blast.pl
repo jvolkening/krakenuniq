@@ -65,6 +65,20 @@ plog( ERROR, 'setup', "DB name mismatch in fetched metadata\n" )
     if ($db ne $meta->{dbname});
 my $expected_size = $meta->{'bytes-total'};
 
+# check if file and/or status flag already exist, and if so bail out
+if (defined $fo_fasta && ! defined $dir_blast) {
+    if (-e $fo_fasta) {
+        if (-e "$fo_fasta.ok") {
+            plog( INFO, 'output', "File $fo_fasta.ok exists, nothing to do" );
+            exit;
+        }
+        elsif (! $overwrite) {
+            plog( ERROR, 'output', "File $fo_fasta exists and --overwrite"
+                . " not given, aborting" );
+        }
+    }
+}
+
 my $staging = File::Temp->newdir(DIR => $tmpdir, CLEANUP => 1);
 my $n_files = scalar @{ $meta->{files} };
 my $n_downloaded = 0;
@@ -92,28 +106,17 @@ if (defined $fo_taxmap) {
 }
 if (defined $fo_fasta) {
     plog( INFO, 'output', "Writing FASTA to $fo_fasta" );
-    if (-e $fo_fasta) {
-        if (-e "$fo_fasta.ok") {
-            plog( INFO, 'output', "File $fo_fasta.ok exists, skipping" );
-        }
-        elsif (! $overwrite) {
-            plog( ERROR, 'output', "File $fo_fasta exists and --overwrite"
-                . " not given, aborting" );
-        }
+    my $n_seqs = write_fasta("$staging/$db", $fo_fasta);
+    if ($n_seqs != $meta->{'number-of-sequences'}) {
+        plog( ERROR, 'output', sprintf(
+            "Conversion to FASTA returned wrong sequence count"
+            . " (expected %s, got %s)\n",
+            $meta->{'number-of-sequences'},
+            $n_seqs,
+        ));
     }
-    else {
-        my $n_seqs = write_fasta("$staging/$db", $fo_fasta);
-        if ($n_seqs != $meta->{'number-of-sequences'}) {
-            plog( ERROR, 'output', sprintf(
-                "Conversion to FASTA returned wrong sequence count"
-                . " (expected %s, got %s)\n",
-                $meta->{'number-of-sequences'},
-                $n_seqs,
-            ));
-        }
-        open my $out, '>', "$fo_fasta.ok";
-        close $out;
-    }
+    open my $out, '>', "$fo_fasta.ok";
+    close $out;
 }
 
 if (defined $dir_blast) {
