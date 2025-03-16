@@ -910,8 +910,6 @@ sub download_from_blast(@) {
     '--tax_map' => "$fa_file.map",
     '--tmpdir' => $BASE_DIR,
   );
-  push @cmd, '--quiet'
-    if (! $VERBOSE);
   my @tax_maps = download_maps($TAX_DIR, "nucl_gb", "nucl_wgs");
 
   make_path(dirname($fa_file)) unless -d dirname($fa_file);
