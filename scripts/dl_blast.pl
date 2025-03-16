@@ -37,6 +37,7 @@ my $fo_taxmap;
 my $quiet = 0;
 my $gzip = 0;
 my $tmpdir;
+my $overwrite = 0;
 
 GetOptions(
     'db=s' => \$db,
@@ -46,6 +47,7 @@ GetOptions(
     'tmpdir=s' => \$tmpdir,
     'gzip' => \$gzip,
     'quiet' => \$quiet,
+    'overwrite' => \$overwrite,
 );
 
 $fo_fasta = abs_path($fo_fasta)
@@ -90,14 +92,27 @@ if (defined $fo_taxmap) {
 }
 if (defined $fo_fasta) {
     plog( INFO, 'output', "Writing FASTA to $fo_fasta" );
-    my $n_seqs = write_fasta("$staging/$db", $fo_fasta);
-    if ($n_seqs != $meta->{'number-of-sequences'}) {
-        plog( ERROR, 'output', sprintf(
-            "Conversion to FASTA returned wrong sequence count"
-            . " (expected %s, got %s)\n",
-            $meta->{'number-of-sequences'},
-            $n_seqs,
-        ));
+    if (-e $fo_fasta) {
+        if (-e "$fo_fasta.ok") {
+            plog( INFO, 'output', "File $fo_fasta.ok exists, skipping" );
+        }
+        elsif (! $overwrite) {
+            plog( ERROR, 'output', "File $fo_fasta exists and --overwrite"
+                . " not given, aborting" );
+        }
+    }
+    else {
+        my $n_seqs = write_fasta("$staging/$db", $fo_fasta);
+        if ($n_seqs != $meta->{'number-of-sequences'}) {
+            plog( ERROR, 'output', sprintf(
+                "Conversion to FASTA returned wrong sequence count"
+                . " (expected %s, got %s)\n",
+                $meta->{'number-of-sequences'},
+                $n_seqs,
+            ));
+        }
+        open my $out, '>', "$fo_fasta.ok";
+        close $out;
     }
 }
 
