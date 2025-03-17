@@ -15,7 +15,7 @@ use File::Temp;
 use Getopt::Long;
 use IO::Compress::Gzip qw/$GzipError/;
 use IPC::Cmd qw/can_run run/;
-use JSON qw/decode_json/;
+use JSON::PP qw/decode_json/;
 use Pod::Usage;
 
 our $VERSION = 0.002;
