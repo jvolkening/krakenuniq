@@ -88,6 +88,8 @@ int main(int argc, char **argv) {
     output_file.write(header, skip_len);
     output_file.write(data, key_ct * (Key_len + val_len));
     output_file.close();
+    if (!output_file)
+      err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
     delete [] data;
   }
   else {
@@ -277,7 +279,8 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     i = j;
   }
   free(buf);
-  close(tmpfd);
+  if (close(tmpfd) != 0)
+    err(EX_IOERR, "error closing temporary file");
 }
 
 static int pair_cmp(const void *a, const void *b) {
