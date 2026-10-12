@@ -86,6 +86,8 @@ int main(int argc, char **argv) {
     if (!output_file.is_open())
       errx(EX_CANTCREAT, "can't open output file %s", Output_DB_filename.c_str());
     output_file.write(header, skip_len);
+    if (!output_file)
+      err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
     output_file.write(data, key_ct * (Key_len + val_len));
     output_file.close();
     if (!output_file)
@@ -98,6 +100,8 @@ int main(int argc, char **argv) {
     if (!output_file.is_open())
       errx(EX_CANTCREAT, "can't open output file %s", Output_DB_filename.c_str());
     output_file.write(header, skip_len);
+    if (!output_file)
+      err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
     bin_and_sort_data_disk(*input_db, db_index, output_file);
     output_file.close();
     if (!output_file)
@@ -227,7 +231,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     memcpy(&kmer, &pair[0], key_len);
     uint64_t b_key = kdb.bin_key(kmer, nt);
     if (Zero_vals)
-      memset(pair.data() + key_len, 0, val_len);
+      memset(&pair[0] + key_len, 0, val_len);
     full_pwrite(tmpfd, &pair[0], pair_size, (off_t) (pos[b_key]++ * pair_size));
   }
   input_file.close();
