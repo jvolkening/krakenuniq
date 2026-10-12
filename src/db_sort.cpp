@@ -155,6 +155,8 @@ static void full_pwrite(int fd, const char *buf, size_t len, off_t off) {
       if (errno == EINTR) continue;
       err(EX_IOERR, "write to temporary file failed");
     }
+    if (n == 0)
+      errx(EX_IOERR, "short write to temporary file");
     buf += n;
     off += n;
     len -= (size_t) n;
@@ -223,7 +225,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     memcpy(&kmer, &pair[0], key_len);
     uint64_t b_key = kdb.bin_key(kmer, nt);
     if (Zero_vals)
-      memset(&pair[0] + key_len, 0, val_len);
+      memset(pair.data() + key_len, 0, val_len);
     full_pwrite(tmpfd, &pair[0], pair_size, (off_t) (pos[b_key]++ * pair_size));
   }
   input_file.close();
@@ -270,6 +272,8 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     }
 
     output_file.write(buf, bytes);
+    if (!output_file)
+      err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
     i = j;
   }
   free(buf);
