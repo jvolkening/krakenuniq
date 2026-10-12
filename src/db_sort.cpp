@@ -42,6 +42,8 @@ bool Operate_in_RAM = false;
 size_t Key_len = 8;
 
 static int pair_cmp(const void *a, const void *b);
+static bool stderr_is_tty();
+static void progress_update(const char *phase, uint64_t done, uint64_t total);
 static void parse_command_line(int argc, char **argv);
 static void bin_and_sort_data_ram(KrakenDB &kdb, char *data, KrakenDBIndex &idx);
 static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
@@ -55,7 +57,7 @@ int main(int argc, char **argv) {
 
   parse_command_line(argc, argv);
 
-  cerr << "db_sort: Getting database into memory ...";
+  cerr << "db_sort: Getting database into memory ..." << endl;
   QuickFile input_db_file(Input_DB_filename);
   KrakenDB *input_db = new KrakenDB(input_db_file.ptr());
   Key_len = input_db->get_key_len();
@@ -74,7 +76,7 @@ int main(int argc, char **argv) {
   input_db = new KrakenDB(header);
   input_db_file.close_file();  // Stop using memory-mapped file
 
-  cerr << "db_sort: Sorting ...";
+  cerr << "db_sort: Sorting ..." << endl;
   if (Operate_in_RAM) {
     // original behavior: whole database loaded in memory
     char *data = new char[ key_ct * (Key_len + val_len) ];
@@ -185,6 +187,36 @@ static void full_pread(int fd, char *buf, size_t len, off_t off) {
   }
 }
 
+static bool stderr_is_tty() {
+  return isatty(fileno(stderr)) != 0;
+}
+
+// Small CLI progress indicator for interactive stderr; updates only when the
+// percentage changes so it stays cheap in tight loops.
+static void progress_update(const char *phase, uint64_t done, uint64_t total) {
+  static string last_phase;
+  static int last_pct = -1;
+
+  if (total == 0)
+    return;
+
+  int pct = (int) ((done * 100ULL) / total);
+  if (last_phase != phase) {
+    last_phase = phase;
+    last_pct = -1;
+  }
+
+  if (!stderr_is_tty())
+    return;
+
+  if (done == total || pct != last_pct) {
+    last_pct = pct;
+    cerr << "\rdb_sort: " << phase << " " << pct << "% (" << done << "/" << total << ")" << flush;
+    if (done == total)
+      cerr << endl;
+  }
+}
+
 // Disk-backed implementation: only a chunk of bins is held in memory at once.
 // Final output is identical to the in-memory path.
 static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
@@ -233,6 +265,8 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     if (Zero_vals)
       memset(&pair[0] + key_len, 0, val_len);
     full_pwrite(tmpfd, &pair[0], pair_size, (off_t) (pos[b_key]++ * pair_size));
+    if ((i & 0xFFFFF) == 0 || i + 1 == key_ct)
+      progress_update("binning", i + 1, key_ct);
   }
   input_file.close();
 
@@ -243,6 +277,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
   char *buf = NULL;
   size_t cap = 0;
   uint64_t i = 0;
+  uint64_t bins_done = 0;
   while (i < entries) {
     uint64_t first_off = offsets[i];
     uint64_t j = i;
@@ -280,6 +315,8 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     output_file.write(buf, bytes);
     if (!output_file)
       err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
+    bins_done += (j - i);
+    progress_update("sorting", bins_done, entries);
     i = j;
   }
   free(buf);
