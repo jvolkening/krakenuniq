@@ -27,6 +27,7 @@
 #include "uid_mapping.hpp"
 #include <unordered_map>
 #include <map>
+#include <sys/file.h>
 
 #define SKIP_LEN 50000
 
@@ -88,6 +89,98 @@ const uint32_t TID_MOUSE = 10090;
 const uint32_t TID_CONTAMINANT1 = 32630; // 'synthetic construct'
 const uint32_t TID_CONTAMINANT2 = 81077; // 'artificial sequences'
 
+void copy_database_file(const string &source, const string &destination) {
+  struct stat source_stat, destination_stat;
+  if (stat(source.c_str(), &source_stat) < 0)
+    err(EX_NOINPUT, "can't stat database %s", source.c_str());
+  if (stat(destination.c_str(), &destination_stat) == 0) {
+    if (source_stat.st_dev == destination_stat.st_dev &&
+        source_stat.st_ino == destination_stat.st_ino)
+      return;
+  } else if (errno != ENOENT) {
+    err(EX_CANTCREAT, "can't stat output database %s", destination.c_str());
+  }
+
+  ifstream input(source.c_str(), ios::in | ios::binary);
+  if (!input.is_open())
+    err(EX_NOINPUT, "can't open database %s", source.c_str());
+  ofstream output(destination.c_str(), ios::out | ios::binary | ios::trunc);
+  if (!output.is_open())
+    err(EX_CANTCREAT, "can't open output database %s", destination.c_str());
+
+  char buffer[1024 * 1024];
+  while (input) {
+    input.read(buffer, sizeof(buffer));
+    streamsize bytes_read = input.gcount();
+    if (bytes_read > 0)
+      output.write(buffer, bytes_read);
+    if (!output)
+      err(EX_IOERR, "error writing output database %s", destination.c_str());
+  }
+  if (!input.eof())
+    err(EX_IOERR, "error reading database %s", source.c_str());
+  output.close();
+  if (!output)
+    err(EX_IOERR, "error closing output database %s", destination.c_str());
+}
+
+void validate_database_layout(KrakenDB &database, size_t db_file_size,
+                              KrakenDBIndex &index, size_t index_file_size) {
+  if (index_file_size < 8)
+    errx(EX_DATAERR, "database index is truncated");
+  const uint8_t indexed_nt = index.indexed_nt();
+  if (indexed_nt == 0 || indexed_nt > 15 || indexed_nt > database.get_k())
+    errx(EX_DATAERR, "database index has an invalid minimizer length");
+
+  const uint64_t bin_count = 1ull << (indexed_nt * 2);
+  if (bin_count > (SIZE_MAX - 16) / sizeof(uint64_t))
+    errx(EX_DATAERR, "database index is too large");
+  const size_t required_index_size =
+      8 + (size_t)(bin_count + 1) * sizeof(uint64_t);
+  if (index_file_size < required_index_size)
+    errx(EX_DATAERR, "database index is truncated");
+
+  if (db_file_size < 72 || database.get_key_bits() == 0 ||
+      database.get_key_bits() >= 64)
+    errx(EX_DATAERR, "database has an invalid header");
+  const size_t header_size = database.header_size();
+  const uint64_t pair_size = database.pair_size();
+  if (header_size > db_file_size || pair_size == 0 ||
+      database.get_key_ct() > (db_file_size - header_size) / pair_size)
+    errx(EX_DATAERR, "database is truncated");
+
+  if (index.at(0) != 0)
+    errx(EX_DATAERR, "database index does not start at the first key");
+  uint64_t previous_offset = 0;
+  const uint64_t key_mask = (1ull << database.get_key_bits()) - 1;
+  for (uint64_t bin = 0; bin < bin_count; ++bin) {
+    const uint64_t begin = index.at(bin);
+    const uint64_t end = index.at(bin + 1);
+    if (begin != previous_offset || end < begin ||
+        end > database.get_key_ct())
+      errx(EX_DATAERR, "database index offsets are invalid");
+
+    uint64_t previous_key = 0;
+    bool have_previous_key = false;
+    char *pair = database.get_pair_ptr() + begin * pair_size;
+    for (uint64_t position = begin; position < end; ++position) {
+      uint64_t key = 0;
+      memcpy(&key, pair, database.get_key_len());
+      key &= key_mask;
+      if (database.bin_key(key) != bin)
+        errx(EX_DATAERR, "database index does not match database keys");
+      if (have_previous_key && key < previous_key)
+        errx(EX_DATAERR, "database keys are not sorted within an index bin");
+      previous_key = key;
+      have_previous_key = true;
+      pair += pair_size;
+    }
+    previous_offset = end;
+  }
+  if (previous_offset != database.get_key_ct())
+    errx(EX_DATAERR, "database index does not cover all keys");
+}
+
 
 int main(int argc, char **argv) {
   #ifdef _OPENMP
@@ -118,27 +211,50 @@ int main(int argc, char **argv) {
   //    return 1;
   //}
 
+  const bool write_to_output = !Output_DB_filename.empty() && !Pretend;
+  const string active_db_filename =
+      write_to_output ? Output_DB_filename : DB_filename;
+  int db_lock_fd = open(active_db_filename.c_str(),
+                        O_RDWR | (write_to_output ? O_CREAT : 0), 0666);
+  if (db_lock_fd < 0)
+    err(EX_OSERR, "unable to open database %s", active_db_filename.c_str());
+  if (flock(db_lock_fd, LOCK_EX | LOCK_NB) < 0)
+    err(EX_OSERR, "unable to lock database %s", active_db_filename.c_str());
+  if (write_to_output) {
+    copy_database_file(DB_filename, Output_DB_filename);
+    DB_filename = Output_DB_filename;
+  }
+
   QuickFile db_file(DB_filename, "rw");
   size_t db_file_size = db_file.size();
+  if (db_file_size < 72)
+    errx(EX_DATAERR, "database is truncated");
   vector<char> dat;
   if (Operate_in_RAM) {
     db_file.close_file();
     dat = slurp_file(DB_filename, db_file_size);
-    Database = KrakenDB(dat.data());
+    Database = KrakenDB(dat.data(), db_file_size);
   } else {
-    Database = KrakenDB(db_file.ptr());
+    Database = KrakenDB(db_file.ptr(), db_file_size);
   }
 
   KmerScanner::set_k(Database.get_k());
 
   QuickFile idx_file(Index_filename);
+  if (idx_file.size() < 8)
+    errx(EX_DATAERR, "database index is truncated");
   KrakenDBIndex db_index(idx_file.ptr());
   Database.set_index(&db_index);
+  validate_database_layout(Database, db_file_size, db_index, idx_file.size());
 
   if (One_FASTA_file)
     process_single_file();
   else
     process_files();
+
+  if (!Operate_in_RAM && !Pretend &&
+      msync(db_file.ptr(), db_file_size, MS_SYNC) < 0)
+    err(EX_IOERR, "unable to sync database %s", DB_filename.c_str());
 
   if (!Kmer_count_filename.empty()) {
     ofstream ofs(Kmer_count_filename.c_str());
@@ -159,14 +275,10 @@ int main(int argc, char **argv) {
     ofs.write(dat.data(), db_file_size);
     ofs.close();
     dat.clear();
-  } else if (!Pretend) {
-    if (Output_DB_filename.size() > 0) {
-      string cmd="cp " + DB_filename + " " + Output_DB_filename;
-      system(cmd.c_str());
-    }
   }
 
   UID_map_file.close();
+  close(db_lock_fd);
 
   // Write new TaxDB file if new taxids were added
   if ((Add_taxIds_for_Sequences || Add_taxIds_for_Assembly) && !TaxDB_filename.empty() && !Pretend) {
@@ -454,6 +566,10 @@ void set_lcas(uint32_t taxid, string &seq, size_t start, size_t finish, bool is_
 #endif
       *val_ptr = uid_mapping(Taxids_to_UID_map, UID_to_taxids_vec, taxid, *val_ptr, current_uid, UID_map_file);
     } else {
+#ifdef _OPENMP
+      #pragma omp critical(kmer_taxid_update)
+#endif
+      {
 	  if (Reset_taxid) {
 	    *val_ptr = 0;
 	  } else {
@@ -469,6 +585,7 @@ void set_lcas(uint32_t taxid, string &seq, size_t start, size_t finish, bool is_
           } else {
             *val_ptr = lca(Parent_map, taxid, *val_ptr);
           }
+		}
 		}
       }
     }
@@ -596,4 +713,3 @@ void usage(int exit_code) {
        << "-F/-m are ignored." << endl;
   exit(exit_code);
 }
-
