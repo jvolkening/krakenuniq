@@ -67,6 +67,7 @@ int main(int argc, char **argv) {
   Key_len = input_db->get_key_len();
   uint64_t val_len = input_db->get_val_len();
   uint64_t key_ct = input_db->get_key_ct();
+  cerr << "db_sort: Generating index file ..." << endl;
   input_db->make_index(Index_filename, Bin_key_nt);
   QuickFile index_file(Index_filename);
   KrakenDBIndex db_index(index_file.ptr());
