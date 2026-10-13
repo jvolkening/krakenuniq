@@ -24,9 +24,13 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <new>
 
 using namespace std;
 using namespace kraken;
@@ -97,7 +101,8 @@ int main(int argc, char **argv) {
     delete [] data;
   }
   else {
-    // disk-backed: bins are staged in a temp file and sorted one chunk at a time
+    // disk-backed: records are partitioned into coarse bin groups in a temp
+    // file using large buffered writes, then each group is sorted in memory
     ofstream output_file(Output_DB_filename.c_str(), std::ofstream::binary);
     if (!output_file.is_open())
       errx(EX_CANTCREAT, "can't open output file %s", Output_DB_filename.c_str());
@@ -191,11 +196,13 @@ static bool stderr_is_tty() {
   return isatty(fileno(stderr)) != 0;
 }
 
-// Small CLI progress indicator for interactive stderr; updates only when the
-// percentage changes so it stays cheap in tight loops.
+// Small CLI progress indicator for interactive stderr. Updates when the
+// percentage changes or at least one second has passed since the last update,
+// so long phases never look frozen. Cheap enough for tight loops.
 static void progress_update(const char *phase, uint64_t done, uint64_t total) {
   static string last_phase;
   static int last_pct = -1;
+  static std::chrono::steady_clock::time_point last_emit;
 
   if (total == 0)
     return;
@@ -204,20 +211,72 @@ static void progress_update(const char *phase, uint64_t done, uint64_t total) {
   if (last_phase != phase) {
     last_phase = phase;
     last_pct = -1;
+    last_emit = std::chrono::steady_clock::time_point();
   }
 
   if (!stderr_is_tty())
     return;
 
-  if (done == total || pct != last_pct) {
+  std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  bool timed = (now - last_emit) >= std::chrono::seconds(1);
+
+  if (done == total || pct != last_pct || timed) {
     last_pct = pct;
+    last_emit = now;
     cerr << "\rdb_sort: " << phase << " " << pct << "% (" << done << "/" << total << ")" << flush;
     if (done == total)
       cerr << endl;
   }
 }
 
-// Disk-backed implementation: only a chunk of bins is held in memory at once.
+// Size the temp file. On Linux, try to reserve the blocks up front (avoids a
+// sparse file and mid-run ENOSPC); fall back to a plain ftruncate if the
+// filesystem doesn't support it.
+static void ensure_temp_file_size(int fd, off_t size) {
+#if defined(__linux__)
+  if (size > 0) {
+    int rc;
+    do {
+      rc = fallocate(fd, 0, 0, size);
+    } while (rc != 0 && errno == EINTR);
+    if (rc == 0)
+      return;
+    if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL)
+      err(EX_IOERR, "can't allocate temporary file in %s (disk full?)", Tmp_dir.c_str());
+  }
+#endif
+  if (ftruncate(fd, size) != 0)
+    err(EX_IOERR, "can't size temporary file in %s (disk full?)", Tmp_dir.c_str());
+}
+
+// Best-effort hint: the temp file is about to be read front to back.
+static void temp_fd_advise_sequential(int fd) {
+#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
+  (void) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#else
+  (void) fd;
+#endif
+}
+
+// Flush one group's write buffer with a single pwrite at its cursor.
+static void flush_group(int fd, const char *buf, size_t &fill,
+                        uint64_t &cur, uint64_t end) {
+  if (fill == 0)
+    return;
+  if (cur + fill > end)
+    errx(EX_DATAERR, "input database is inconsistent with its index");
+  full_pwrite(fd, buf, fill, (off_t) cur);
+  cur += fill;
+  fill = 0;
+}
+
+// Disk-backed implementation (two-level distribution sort).
+//
+// Bins are merged into groups of consecutive bins, each at most budget/2
+// bytes. Pass 1 appends records to per-group write buffers and flushes them
+// as large writes into the group's region of the temp file. Pass 2 reads one
+// group at a time, scatters it into bin order, sorts each bin, and appends it
+// to the output. Memory use depends on the budget, not on the number of bins.
 // Final output is identical to the in-memory path.
 static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
                                    ofstream &output_file) {
@@ -238,6 +297,46 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     errx(EX_USAGE, "memory budget too large");
   const uint64_t budget = (uint64_t) (Mem_budget_gib * (1ULL << 30));
 
+  // Pass 2 holds two buffers (read + scatter) of one group each, so a group
+  // may use at most half the budget (a single oversized bin excepted).
+  const uint64_t group_bytes = std::max<uint64_t>(budget / 2, pair_size);
+
+  // gstart[g] .. gstart[g+1] is the bin range of group g (last entry = entries)
+  vector<uint64_t> gstart;
+  for (uint64_t i = 0; i < entries; ) {
+    uint64_t j = i;
+    while (j < entries && (offsets[j+1] - offsets[i]) * pair_size <= group_bytes)
+      j++;
+    if (j == i)  // bin i alone exceeds the group size
+      j = i + 1;
+    gstart.push_back(i);
+    i = j;
+  }
+  gstart.push_back(entries);
+  const size_t ng = gstart.size() - 1;
+
+  // Per-group write buffer: share the budget, cap at 4 MiB, floor at 4 KiB,
+  // and keep it a whole number of pairs.
+  uint64_t wb = budget / ng;
+  wb = std::min<uint64_t>(wb, 4ULL << 20);
+  wb = std::max<uint64_t>(wb, 4096);
+  wb -= wb % pair_size;
+  if (wb < pair_size)
+    wb = pair_size;
+
+  vector<char> wbuf;
+  try {
+    wbuf.resize((size_t) ng * (size_t) wb);
+  } catch (std::exception &) {
+    errx(EX_OSERR, "can't allocate write buffers; try a larger -m or a smaller -n");
+  }
+  vector<size_t> wfill(ng, 0);
+  vector<uint64_t> wcur(ng), wend(ng);  // byte cursors into the temp file
+  for (size_t g = 0; g < ng; g++) {
+    wcur[g] = offsets[gstart[g]] * pair_size;
+    wend[g] = offsets[gstart[g+1]] * pair_size;
+  }
+
   // Temp file, unlinked immediately so it is cleaned up on any exit
   string tmpl = Tmp_dir + "/db_sort_XXXXXX";
   vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
@@ -247,14 +346,12 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     err(EX_CANTCREAT, "can't create temporary file in %s", Tmp_dir.c_str());
   unlink(&tmpl_buf[0]);
 
-  if (ftruncate(tmpfd, (off_t) (key_ct * pair_size)) != 0)
-    err(EX_IOERR, "can't size temporary file in %s (disk full?)", Tmp_dir.c_str());
+  ensure_temp_file_size(tmpfd, (off_t) (key_ct * pair_size));
 
+  // ---- Pass 1: sequential read, buffered appends into per-group regions ----
   ifstream input_file(Input_DB_filename.c_str(), std::ifstream::binary);
   input_file.seekg(kdb.header_size(), ios_base::beg);
 
-  // Copy of offsets used as insertion positions
-  vector<uint64_t> pos(offsets, offsets + entries);
   for (uint64_t i = 0; i < key_ct; i++) {
     input_file.read(&pair[0], pair_size);
     if ((uint64_t) input_file.gcount() != pair_size)
@@ -262,64 +359,99 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     uint64_t kmer = 0;
     memcpy(&kmer, &pair[0], key_len);
     uint64_t b_key = kdb.bin_key(kmer, nt);
+    if (b_key >= entries)
+      errx(EX_DATAERR, "bin key out of range; input database is inconsistent with its index");
     if (Zero_vals)
       memset(&pair[0] + key_len, 0, val_len);
-    full_pwrite(tmpfd, &pair[0], pair_size, (off_t) (pos[b_key]++ * pair_size));
+
+    size_t g = (size_t) (std::upper_bound(gstart.begin(), gstart.end(), b_key)
+                         - gstart.begin()) - 1;
+    char *gb = &wbuf[g * (size_t) wb];
+    memcpy(gb + wfill[g], &pair[0], pair_size);
+    wfill[g] += pair_size;
+    if (wfill[g] == wb)
+      flush_group(tmpfd, gb, wfill[g], wcur[g], wend[g]);
+
     if ((i & 0xFFFFF) == 0 || i + 1 == key_ct)
       progress_update("binning", i + 1, key_ct);
   }
   input_file.close();
 
-  // Group consecutive bins into chunks of at most `budget` bytes. Bins are
-  // contiguous in the temp file, so each chunk is one sequential read. Bins
-  // within a chunk are sorted in parallel; chunks are written in order.
-  // A single bin larger than the budget forms its own chunk.
-  char *buf = NULL;
+  for (size_t g = 0; g < ng; g++) {
+    flush_group(tmpfd, &wbuf[g * (size_t) wb], wfill[g], wcur[g], wend[g]);
+    if (wcur[g] != wend[g])
+      errx(EX_DATAERR, "input database is inconsistent with its index");
+  }
+  // Release write buffers before pass 2
+  vector<char>().swap(wbuf);
+
+  temp_fd_advise_sequential(tmpfd);
+
+  // ---- Pass 2: per group, one sequential read, scatter to bins, sort, write ----
+  char *in = NULL, *out = NULL;
   size_t cap = 0;
-  uint64_t i = 0;
   uint64_t bins_done = 0;
-  while (i < entries) {
-    uint64_t first_off = offsets[i];
-    uint64_t j = i;
-    // grow j while total bytes from first_off to offsets[j+1] fit in budget
-    while (j < entries && (offsets[j+1] - first_off) * pair_size <= budget)
-      j++;
-    if (j == i)  // bin i alone exceeds the budget
-      j = i + 1;
-    uint64_t bytes64 = (offsets[j] - first_off) * pair_size;
+  vector<uint64_t> lpos;
+  for (size_t g = 0; g < ng; g++) {
+    uint64_t lo = gstart[g], hi = gstart[g+1];
+    uint64_t first_off = offsets[lo];
+    uint64_t bytes64 = (offsets[hi] - first_off) * pair_size;
     if (bytes64 == 0) {  // only empty bins
-      i = j;
+      bins_done += hi - lo;
       continue;
     }
     size_t bytes = (size_t) bytes64;
     if (bytes > cap) {
-      free(buf);
-      buf = (char *) malloc(bytes);
-      if (buf == NULL)
-        errx(EX_OSERR, "can't allocate %llu bytes for bin(s) starting at %llu; "
+      free(in);
+      free(out);
+      in = (char *) malloc(bytes);
+      out = (char *) malloc(bytes);
+      if (in == NULL || out == NULL)
+        errx(EX_OSERR, "can't allocate 2 x %llu bytes for bin(s) starting at %llu; "
              "try a larger -n value or a larger -m",
-             (unsigned long long) bytes, (unsigned long long) i);
+             (unsigned long long) bytes, (unsigned long long) lo);
       cap = bytes;
     }
-    full_pread(tmpfd, buf, bytes, (off_t) (first_off * pair_size));
+    full_pread(tmpfd, in, bytes, (off_t) (first_off * pair_size));
 
-    // Parallel sort of the bins in this chunk
+    // Local insertion positions (in pairs, relative to the group) per bin
+    lpos.resize((size_t) (hi - lo));
+    for (uint64_t b = lo; b < hi; b++)
+      lpos[(size_t) (b - lo)] = offsets[b] - first_off;
+
+    // Scatter pairs into bin order (stable: input order preserved per bin)
+    uint64_t n = bytes64 / pair_size;
+    for (uint64_t k = 0; k < n; k++) {
+      const char *src = in + k * pair_size;
+      uint64_t kmer = 0;
+      memcpy(&kmer, src, key_len);
+      uint64_t b = kdb.bin_key(kmer, nt);
+      if (b < lo || b >= hi)
+        errx(EX_DATAERR, "temporary file contents inconsistent with index");
+      uint64_t &p = lpos[(size_t) (b - lo)];
+      if (p >= offsets[b+1] - first_off)
+        errx(EX_DATAERR, "temporary file contents inconsistent with index");
+      memcpy(out + p * pair_size, src, pair_size);
+      p++;
+    }
+
+    // Parallel sort of the bins in this group
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 16)
 #endif
-    for (uint64_t b = i; b < j; b++) {
-      qsort(buf + (offsets[b] - first_off) * pair_size,
+    for (uint64_t b = lo; b < hi; b++) {
+      qsort(out + (offsets[b] - first_off) * pair_size,
             offsets[b+1] - offsets[b], pair_size, pair_cmp);
     }
 
-    output_file.write(buf, bytes);
+    output_file.write(out, bytes);
     if (!output_file)
       err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
-    bins_done += (j - i);
+    bins_done += hi - lo;
     progress_update("sorting", bins_done, entries);
-    i = j;
   }
-  free(buf);
+  free(in);
+  free(out);
   if (close(tmpfd) != 0)
     err(EX_IOERR, "error closing temporary file");
 }
