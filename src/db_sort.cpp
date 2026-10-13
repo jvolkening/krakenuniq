@@ -390,14 +390,14 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
   // ---- Pass 2: per group, one sequential read, scatter to bins, sort, write ----
   char *in = NULL, *out = NULL;
   size_t cap = 0;
-  uint64_t bins_done = 0;
+  uint64_t recs_done = 0;
   vector<uint64_t> lpos;
   for (size_t g = 0; g < ng; g++) {
     uint64_t lo = gstart[g], hi = gstart[g+1];
     uint64_t first_off = offsets[lo];
     uint64_t bytes64 = (offsets[hi] - first_off) * pair_size;
-    if (bytes64 == 0) {  // only empty bins
-      bins_done += hi - lo;
+    if (bytes64 == 0) {
+      // no work to report for empty bins
       continue;
     }
     size_t bytes = (size_t) bytes64;
@@ -447,8 +447,8 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     output_file.write(out, bytes);
     if (!output_file)
       err(EX_IOERR, "error writing output file %s", Output_DB_filename.c_str());
-    bins_done += hi - lo;
-    progress_update("sorting", bins_done, entries);
+    recs_done += offsets[hi] - first_off;
+    progress_update("sorting", recs_done, key_ct);
   }
   free(in);
   free(out);
