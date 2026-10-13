@@ -27,6 +27,8 @@
 #include "uid_mapping.hpp"
 #include <unordered_map>
 #include <map>
+#include <algorithm>
+#include <cmath>
 #include <sys/file.h>
 
 #define SKIP_LEN 50000
@@ -40,6 +42,8 @@ void process_files();
 void process_single_file();
 void process_file(string filename, uint32_t taxid);
 void set_lcas(uint32_t taxid, string &seq, size_t start, size_t finish, bool is_contaminant_taxid = false);
+void add_sequence(uint32_t taxid, string &seq, bool is_contaminant_taxid);
+void flush_kmers();
 
 int Num_threads = 1;
 string DB_filename, Index_filename,
@@ -62,14 +66,14 @@ bool Output_UID_map_to_STDOUT = false;
 bool Pretend = false;
 uint32_t Minimum_sequence_size = 0;
 
+// Memory budget (GiB) for the batched k-mer update buffer
+double Memory_budget_gib = 1.0;
+
 string UID_map_filename;
 ofstream UID_map_file;
 
 uint32_t current_uid = 0;
 unordered_map<uint32_t, uint32_t> Parent_map;
-//unordered_multimap<uint32_t, uint32_t> Children_map;
-//typedef std::_Rb_tree_iterator<std::pair<const std::set<unsigned int>, unsigned int> > map_it;
-//typedef std::_Rb_tree_iterator<std::pair<const std::vector<unsigned int>, unsigned int> > map_it;
 vector< const TaxidSet*  > UID_to_taxids_vec;
 map< TaxidSet, uint32_t> Taxids_to_UID_map;
 
@@ -88,6 +92,65 @@ const uint32_t TID_MOUSE = 10090;
 //  sequence taxid, even if they also appear in a genome
 const uint32_t TID_CONTAMINANT1 = 32630; // 'synthetic construct'
 const uint32_t TID_CONTAMINANT2 = 81077; // 'artificial sequences'
+
+// ---------------------------------------------------------------------
+// Batched update machinery (non-UID mode)
+// ---------------------------------------------------------------------
+struct KmerRec {
+  uint64_t kmer;   // canonical k-mer
+  uint32_t bin;    // DB index bin of the k-mer
+  uint32_t seq;    // index into Seq_info (preserves original update order)
+};
+
+struct SeqInfo {
+  uint32_t taxid;
+  bool is_contaminant;
+};
+
+static inline bool kmer_rec_less(const KmerRec &a, const KmerRec &b) {
+  if (a.bin != b.bin) return a.bin < b.bin;
+  if (a.kmer != b.kmer) return a.kmer < b.kmer;
+  return a.seq < b.seq;
+}
+
+vector<KmerRec> Kmer_buffer;
+vector<SeqInfo> Seq_info;
+size_t Max_records = 0;
+size_t Group_chunks = 1;
+
+// Cache of lca() results (lca is a pure function of its arguments)
+unordered_map<uint64_t, uint32_t> Lca_cache;
+const size_t LCA_CACHE_MAX = 4u << 20;
+
+static inline uint32_t cached_lca(uint32_t a, uint32_t b) {
+  const uint64_t key = ((uint64_t)a << 32) | b;
+  auto it = Lca_cache.find(key);
+  if (it != Lca_cache.end())
+    return it->second;
+  uint32_t r = lca(Parent_map, a, b);
+  if (Lca_cache.size() >= LCA_CACHE_MAX)
+    Lca_cache.clear();
+  Lca_cache.emplace(key, r);
+  return r;
+}
+
+// Apply one update to a k-mer value (same semantics as the original code)
+static inline void apply_update(uint32_t &val, uint32_t taxid, bool is_contaminant_taxid) {
+  if (Reset_taxid) {
+    val = 0;
+  } else if (!Force_contaminant_taxid) {
+    val = cached_lca(taxid, val);
+  } else {
+    if (val == TID_CONTAMINANT1 || val == TID_CONTAMINANT2) {
+      // keep value
+    } else if (is_contaminant_taxid) {
+      // assign the taxid of the (last) sequence to k-mers
+      val = taxid;
+    } else {
+      val = cached_lca(taxid, val);
+    }
+  }
+}
 
 void copy_database_file(const string &source, const string &destination) {
   struct stat source_stat, destination_stat;
@@ -206,11 +269,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  //if (!Operate_in_RAM && Output_DB_filename.size() > 0) {
-  //    cerr << "You need to operate in RAM (flag -M) to use output to a different file (flag -o)" << endl;
-  //    return 1;
-  //}
-
   const bool write_to_output = !Output_DB_filename.empty() && !Pretend;
   const string active_db_filename =
       write_to_output ? Output_DB_filename : DB_filename;
@@ -247,10 +305,29 @@ int main(int argc, char **argv) {
   Database.set_index(&db_index);
   validate_database_layout(Database, db_file_size, db_index, idx_file.size());
 
+  // Set up the batch buffer (not used in UID mode)
+  if (!Use_uids_instead_of_taxids) {
+    double bytes = Memory_budget_gib * 1024.0 * 1024.0 * 1024.0;
+    double max_rec_d = bytes / (double)sizeof(KmerRec);
+    const double cap = (double)(SIZE_MAX / sizeof(KmerRec) / 2);
+    if (max_rec_d > cap) max_rec_d = cap;
+    Max_records = (size_t)max_rec_d;
+    if (Max_records < 2 * (size_t)SKIP_LEN)
+      Max_records = 2 * (size_t)SKIP_LEN;
+    Group_chunks = (Max_records / 2) / SKIP_LEN;
+    if (Group_chunks < 1) Group_chunks = 1;
+    // Reserve once so the buffer never reallocates (keeps memory bounded)
+    Kmer_buffer.reserve(Max_records);
+  }
+
   if (One_FASTA_file)
     process_single_file();
   else
     process_files();
+
+  // Apply any remaining pending updates before syncing / counting
+  flush_kmers();
+  { vector<KmerRec>().swap(Kmer_buffer); }
 
   if (!Operate_in_RAM && !Pretend &&
       msync(db_file.ptr(), db_file_size, MS_SYNC) < 0)
@@ -301,11 +378,9 @@ uint32_t get_new_taxid(
   if (it == name_to_taxid_map.end()) {
     uint32_t new_taxid = ++New_taxid_start;
     bool insert_res = taxdb.insert(new_taxid, parent_taxid, rank_name, name);
-    //cerr << "Adding assembly: " << name << " with taxid " << new_taxid;
     if (!insert_res) {
       return 0;
     }
-    // insert_res shows if insert failed, but we don't care
     Parent_map[new_taxid] = parent_taxid;
     name_to_taxid_map[name] = new_taxid;
     return new_taxid;
@@ -378,8 +453,6 @@ unordered_map<string,uint32_t> read_seqid_to_taxid_map(string ID_to_taxon_map_fi
 }
 
 void process_single_file() {
-  //cerr << "Processing FASTA files" << endl;
- 
   ID_to_taxon_map = read_seqid_to_taxid_map(ID_to_taxon_map_filename, taxdb, Parent_map, Add_taxIds_for_Assembly, Add_taxIds_for_Sequences);
 
   FastaReader reader(Multi_fasta_filename);
@@ -440,11 +513,11 @@ void process_single_file() {
         continue;
     }
 
-	if (Minimum_sequence_size > 0 && dna.seq.size() < Minimum_sequence_size) {
+    if (Minimum_sequence_size > 0 && dna.seq.size() < Minimum_sequence_size) {
       cerr << "Skipping sequence " << dna.id << " as it's too short (" << dna.seq.size() << ")" << endl;
-	  ++ seqs_skipped;
-	  continue;
-	}
+      ++ seqs_skipped;
+      continue;
+    }
 
     auto it_p = Parent_map.find(taxid);
     if (it_p == Parent_map.end()) {
@@ -464,21 +537,12 @@ void process_single_file() {
       }
     }
 
-    // TODO: Allow exclusion of certain taxids in the building process
-    //if (Excluded_taxons.count(taxid) > 0) {
-      // exclude taxid!
-    //}
-
     if (taxid) {
       if (Parent_map.find(taxid) == Parent_map.end() || taxdb.entries.find(taxid) == taxdb.entries.end()) {
         cerr << "Ignoring sequence for taxID " << taxid << " - not in taxDB\n";
       } else {
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic)
-#endif
-        for (size_t i = 0; i < dna.seq.size(); i += SKIP_LEN)
-          set_lcas(taxid, dna.seq, i, i + SKIP_LEN + Database.get_k() - 1, is_contaminant_taxid);
-         ++seqs_processed;
+        add_sequence(taxid, dna.seq, is_contaminant_taxid);
+        ++seqs_processed;
       }
     } else {
       if (verbose) 
@@ -526,18 +590,167 @@ void process_file(string filename, uint32_t taxid) {
   // single-fasta files.
   dna = reader.next_sequence();
 
-#ifdef _OPENMP
-  #pragma omp parallel for schedule(dynamic)
-#endif
-  for (size_t i = 0; i < dna.seq.size(); i += SKIP_LEN)
-    set_lcas(taxid, dna.seq, i, i + SKIP_LEN + Database.get_k() - 1);
+  add_sequence(taxid, dna.seq, false);
 }
 
-//void process_sequence(DNASequence dna) {
-  // TODO: Refactor such that a list of files + taxid can be given.
-  // Or maybe asembly_summary file?
-//}
+// ---------------------------------------------------------------------
+// Batched path
+// ---------------------------------------------------------------------
 
+// Scan a region and append pending updates to the shared buffer.
+static void collect_kmers(uint32_t seq_idx, string &seq, size_t start, size_t finish) {
+  KmerScanner scanner(seq, start, finish);
+  uint64_t *kmer_ptr;
+  vector<KmerRec> local;
+  local.reserve(SKIP_LEN + 64);
+
+  while ((kmer_ptr = scanner.next_kmer()) != NULL) {
+    if (scanner.ambig_kmer())
+      continue;
+    KmerRec r;
+    r.kmer = Database.canonical_representation(*kmer_ptr);
+    r.bin = (uint32_t)Database.bin_key(r.kmer);
+    r.seq = seq_idx;
+    local.push_back(r);
+  }
+  if (local.empty())
+    return;
+#ifdef _OPENMP
+  #pragma omp critical(kmer_buffer_append)
+#endif
+  Kmer_buffer.insert(Kmer_buffer.end(), local.begin(), local.end());
+}
+
+// Sort pending updates into DB order and apply them in a single pass.
+// Updates to the same k-mer are applied in original (sequence) order.
+void flush_kmers() {
+  if (Kmer_buffer.empty())
+    return;
+  sort(Kmer_buffer.begin(), Kmer_buffer.end(), kmer_rec_less);
+
+  KrakenDBIndex *index = Database.get_index();
+  char *pairs = Database.get_pair_ptr();
+  const uint64_t pair_sz = Database.pair_size();
+  const uint64_t key_len = Database.get_key_len();
+  const uint64_t key_mask = (1ull << Database.get_key_bits()) - 1;
+
+  const size_t n = Kmer_buffer.size();
+  bool have_bin = false;
+  uint32_t cur_bin = 0;
+  uint64_t bin_end = 0;
+  uint64_t cursor = 0;  // keys before cursor in this bin are < current k-mer
+
+  size_t i = 0;
+  while (i < n) {
+    const uint64_t kmer = Kmer_buffer[i].kmer;
+    const uint32_t bin = Kmer_buffer[i].bin;
+    size_t j = i + 1;
+    while (j < n && Kmer_buffer[j].kmer == kmer)
+      ++j;
+
+    if (!have_bin || bin != cur_bin) {
+      have_bin = true;
+      cur_bin = bin;
+      cursor = index->at(bin);
+      bin_end = index->at((uint64_t)bin + 1);
+    }
+
+    // lower_bound for kmer within [cursor, bin_end)
+    uint64_t lo = cursor, hi = bin_end;
+    while (lo < hi) {
+      const uint64_t mid = lo + (hi - lo) / 2;
+      uint64_t key = 0;
+      memcpy(&key, pairs + pair_sz * mid, key_len);
+      key &= key_mask;
+      if (key < kmer)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    bool found = false;
+    if (lo < bin_end) {
+      uint64_t key = 0;
+      memcpy(&key, pairs + pair_sz * lo, key_len);
+      key &= key_mask;
+      found = (key == kmer);
+    }
+
+    if (!found) {
+      cursor = lo;
+      if (!Allow_extra_kmers) {
+        errx(EX_DATAERR, "kmer found in sequence that is not in database");
+      } else if (verbose) {
+        for (size_t x = i; x < j; ++x)
+          cerr << "kmer found in sequence w/ taxid " << Seq_info[Kmer_buffer[x].seq].taxid
+               << " that is not in database" << endl;
+      }
+    } else {
+      char *val_loc = pairs + pair_sz * lo + key_len;
+      uint32_t original;
+      memcpy(&original, val_loc, sizeof(original));
+      uint32_t val = original;
+
+      bool have_prev = false;
+      uint32_t prev_taxid = 0;
+      bool prev_contam = false;
+      for (size_t x = i; x < j; ++x) {
+        const SeqInfo &si = Seq_info[Kmer_buffer[x].seq];
+        // Consecutive identical updates are idempotent - skip them
+        if (have_prev && si.taxid == prev_taxid && si.is_contaminant == prev_contam)
+          continue;
+        apply_update(val, si.taxid, si.is_contaminant);
+        have_prev = true;
+        prev_taxid = si.taxid;
+        prev_contam = si.is_contaminant;
+      }
+      // Only write when changed, to avoid dirtying mmapped pages needlessly
+      if (val != original)
+        memcpy(val_loc, &val, sizeof(val));
+      cursor = lo + 1;
+    }
+    i = j;
+  }
+  Kmer_buffer.clear();
+}
+
+// UID mode applies updates immediately (UID numbering depends on encounter
+// order); otherwise updates are batched.
+void add_sequence(uint32_t taxid, string &seq, bool is_contaminant_taxid) {
+  if (Use_uids_instead_of_taxids) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
+    for (size_t i = 0; i < seq.size(); i += SKIP_LEN)
+      set_lcas(taxid, seq, i, i + SKIP_LEN + Database.get_k() - 1, is_contaminant_taxid);
+    return;
+  }
+
+  // No pending records means no outstanding references into Seq_info
+  if (Kmer_buffer.empty())
+    Seq_info.clear();
+
+  const uint32_t seq_idx = (uint32_t)Seq_info.size();
+  SeqInfo si;
+  si.taxid = taxid;
+  si.is_contaminant = is_contaminant_taxid;
+  Seq_info.push_back(si);
+
+  const size_t group_bases = Group_chunks * (size_t)SKIP_LEN;
+  for (size_t g = 0; g < seq.size(); g += group_bases) {
+    const size_t gend = min(seq.size(), g + group_bases);
+    // Upper bound on k-mers produced by this group
+    const size_t need = gend - g;
+    if (Kmer_buffer.size() + need > Max_records)
+      flush_kmers();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
+    for (size_t i = g; i < gend; i += SKIP_LEN)
+      collect_kmers(seq_idx, seq, i, i + SKIP_LEN + Database.get_k() - 1);
+  }
+}
+
+// Original immediate-update implementation; only used for the UID path.
 void set_lcas(uint32_t taxid, string &seq, size_t start, size_t finish, bool is_contaminant_taxid) {
   KmerScanner scanner(seq, start, finish);
   uint64_t *kmer_ptr;
@@ -559,36 +772,10 @@ void set_lcas(uint32_t taxid, string &seq, size_t start, size_t finish, bool is_
       continue;
     }
 
-    // TODO: Should I use pragma omp critical here?
-    if (Use_uids_instead_of_taxids) {
 #ifdef _OPENMP
-      #pragma omp critical(new_uid)
+    #pragma omp critical(new_uid)
 #endif
-      *val_ptr = uid_mapping(Taxids_to_UID_map, UID_to_taxids_vec, taxid, *val_ptr, current_uid, UID_map_file);
-    } else {
-#ifdef _OPENMP
-      #pragma omp critical(kmer_taxid_update)
-#endif
-      {
-	  if (Reset_taxid) {
-	    *val_ptr = 0;
-	  } else {
-        if (!Force_contaminant_taxid) {
-          *val_ptr = lca(Parent_map, taxid, *val_ptr);
-        } else {
-          if (*val_ptr == TID_CONTAMINANT1 || *val_ptr == TID_CONTAMINANT2) {
-            // keep value
-          } else if (is_contaminant_taxid) {
-            // When Force_contaminant_taxid is set, do not compute lca, but assign the taxid
-            // of the (last) sequence to k-mers
-            *val_ptr = taxid;
-          } else {
-            *val_ptr = lca(Parent_map, taxid, *val_ptr);
-          }
-		}
-		}
-      }
-    }
+    *val_ptr = uid_mapping(Taxids_to_UID_map, UID_to_taxids_vec, taxid, *val_ptr, current_uid, UID_map_file);
   }
 }
 
@@ -598,7 +785,7 @@ void parse_command_line(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "-h") == 0)
     usage(0);
-  while ((opt = getopt(argc, argv, "f:d:i:t:n:m:F:xMTRvb:aApI:o:Sc:E:")) != -1) {
+  while ((opt = getopt(argc, argv, "f:d:i:t:n:m:F:xMTRvb:aApI:o:Sc:E:B:")) != -1) {
     switch (opt) {
       case 'f' :
         File_to_taxon_map_filename = optarg;
@@ -633,9 +820,9 @@ void parse_command_line(int argc, char **argv) {
       case 'T' :
         Force_contaminant_taxid = true;
         break;
-	  case 'R' :
-		Reset_taxid = true;
-		break;
+      case 'R' :
+        Reset_taxid = true;
+        break;
       case 'v' :
         verbose = true;
         break;
@@ -662,7 +849,17 @@ void parse_command_line(int argc, char **argv) {
         break;
       case 'E' :
         Minimum_sequence_size = atoi(optarg);
-		break;
+        break;
+      case 'B' : {
+        char *endp = NULL;
+        errno = 0;
+        double gib = strtod(optarg, &endp);
+        if (errno || endp == optarg || *endp != '\0' ||
+            !std::isfinite(gib) || gib <= 0)
+          errx(EX_USAGE, "memory budget must be a positive number of GiB");
+        Memory_budget_gib = gib;
+        break;
+      }
       case 'p' :
         Pretend = true;
         break;
@@ -694,6 +891,7 @@ void usage(int exit_code) {
        << "* -b filename      Taxonomy DB file" << endl
        << "  -t #             Number of threads" << endl
        << "  -M               Copy DB to RAM during operation" << endl
+       << "  -B #             Memory budget in GiB for the sorted k-mer update buffer (default 1; fractions allowed)" << endl
        << "  -o filename      Output database to filename, instead of overwriting the input database" << endl
        << "  -x               K-mers not found in DB do not cause errors" << endl
        << "  -f filename      File to taxon map" << endl
@@ -701,9 +899,8 @@ void usage(int exit_code) {
        << "  -m filename      Sequence ID to taxon map" << endl
        << "  -a               Add taxonomy IDs (starting with "<<(New_taxid_start+1)<<") for assemblies (third column in seqid2taxid.map) to Taxonomy DB" << endl
        << "  -A               Add taxonomy IDs (starting with "<<(New_taxid_start+1)<<") for sequences to Taxonomy DB" << endl
-       //<< "  -T               Do not set LCA as taxid for kmers, but the taxid of the sequence" << endl
        << "  -T               When a k-mer appears in a 'synthetic construct' sequence, force the taxID to be the 'synthetic construct' taxID, instead of the LCA." << endl
-	   << "  -E #             Exclude sequences that are shorter than the threshold." << endl
+       << "  -E #             Exclude sequences that are shorter than the threshold." << endl
        << "  -I filename      Write UIDs into database, and output (binary) UID-to-taxid map to filename" << endl
        << "  -p               Pretend - do not write database back to disk (when working in RAM)" << endl
        << "  -v               Verbose output" << endl
