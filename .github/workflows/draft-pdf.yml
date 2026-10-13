@@ -2,6 +2,7 @@ on: [push]
 
 jobs:
   paper:
+    if: false # no need to keep building manuscript, and it's failing anyway
     runs-on: ubuntu-latest
     name: Paper Draft
     steps:
