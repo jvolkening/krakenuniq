@@ -82,7 +82,6 @@ int main(int argc, char **argv) {
 
   cerr << "db_sort: Sorting ..." << endl;
   if (Operate_in_RAM) {
-    // original behavior: whole database loaded in memory
     char *data = new char[ key_ct * (Key_len + val_len) ];
     // Populate data w/ pairs from DB and sort bins in parallel
     bin_and_sort_data_ram(*input_db, data, db_index);
@@ -126,7 +125,6 @@ static void bin_and_sort_data_ram(KrakenDB &kdb, char *data, KrakenDBIndex &idx)
   uint64_t key_len = kdb.get_key_len();
   uint64_t val_len = kdb.get_val_len();
   uint64_t pair_size = key_len + val_len;
-  // Use VLA-like small buffer for reads; pair_size is small and known
   vector<char> pair(pair_size);
 
   ifstream input_file(Input_DB_filename.c_str(), std::ifstream::binary);
@@ -196,9 +194,7 @@ static bool stderr_is_tty() {
   return isatty(fileno(stderr)) != 0;
 }
 
-// Small CLI progress indicator for interactive stderr. Updates when the
-// percentage changes or at least one second has passed since the last update,
-// so long phases never look frozen. Cheap enough for tight loops.
+// Nice to know how things are going since this can take a while
 static void progress_update(const char *phase, uint64_t done, uint64_t total) {
   static string last_phase;
   static int last_pct = -1;
@@ -270,14 +266,13 @@ static void flush_group(int fd, const char *buf, size_t &fill,
   fill = 0;
 }
 
-// Disk-backed implementation (two-level distribution sort).
+// Disk-backed implementation (two-level distribution sort) for lower-memory
+// systems
 //
 // Bins are merged into groups of consecutive bins, each at most budget/2
 // bytes. Pass 1 appends records to per-group write buffers and flushes them
-// as large writes into the group's region of the temp file. Pass 2 reads one
-// group at a time, scatters it into bin order, sorts each bin, and appends it
-// to the output. Memory use depends on the budget, not on the number of bins.
-// Final output is identical to the in-memory path.
+// into the group's region of the temp file. Pass 2 reads one group at a time,
+// scatters it into bin order, sorts each bin, and appends it to the output.
 static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
                                    ofstream &output_file) {
   uint8_t nt = idx.indexed_nt();
@@ -289,7 +284,6 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
   uint64_t key_ct = kdb.get_key_ct();
   vector<char> pair(pair_size);
 
-  // Convert GiB budget to bytes (GiB == 2^30 bytes)
   if (!(Mem_budget_gib > 0.0))
     errx(EX_USAGE, "memory budget must be a positive number of GiB");
   const long double max_gib = (long double) ( (long double) UINT64_MAX / (long double)(1ULL << 30) );
@@ -348,7 +342,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
 
   ensure_temp_file_size(tmpfd, (off_t) (key_ct * pair_size));
 
-  // ---- Pass 1: sequential read, buffered appends into per-group regions ----
+  // pass 1: sequential read, buffered appends into per-group regions
   ifstream input_file(Input_DB_filename.c_str(), std::ifstream::binary);
   input_file.seekg(kdb.header_size(), ios_base::beg);
 
@@ -382,12 +376,12 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     if (wcur[g] != wend[g])
       errx(EX_DATAERR, "input database is inconsistent with its index");
   }
-  // Release write buffers before pass 2
+  // release write buffers before pass 2
   vector<char>().swap(wbuf);
 
   temp_fd_advise_sequential(tmpfd);
 
-  // ---- Pass 2: per group, one sequential read, scatter to bins, sort, write ----
+  // pass 2: per group, one sequential read, scatter to bins, sort, write
   char *in = NULL, *out = NULL;
   size_t cap = 0;
   uint64_t recs_done = 0;
@@ -419,7 +413,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
     for (uint64_t b = lo; b < hi; b++)
       lpos[(size_t) (b - lo)] = offsets[b] - first_off;
 
-    // Scatter pairs into bin order (stable: input order preserved per bin)
+    // Scatter pairs into bin order
     uint64_t n = bytes64 / pair_size;
     for (uint64_t k = 0; k < n; k++) {
       const char *src = in + k * pair_size;
@@ -530,7 +524,7 @@ void parse_command_line(int argc, char **argv) {
       || Index_filename.empty())
     usage();
 
-  // Resolve temp directory: -T, then $TMPDIR, then /tmp
+  // resolve temp directory: -T, then $TMPDIR, then /tmp
   if (Tmp_dir.empty()) {
     const char *env = getenv("TMPDIR");
     Tmp_dir = (env != NULL && env[0] != '\0') ? env : "/tmp";
@@ -547,8 +541,10 @@ void parse_command_line(int argc, char **argv) {
 
 void usage(int exit_code) {
   cerr << "Usage: db_sort [-z] [-M] [-t threads] [-T tmpdir] [-m GiB] <-d input db> <-o output db> <-i output idx>\n"
-       << "  -M  sort entirely in RAM (original behavior); otherwise sort on disk\n"
-       << "  -T  directory for temporary file (default: $TMPDIR, else /tmp)\n"
+       << "  -z  zero out all counts (default: false)\n"
+       << "  -M  sort entirely in RAM (default: sort on disk)\n"
+       << "  -t  number of threads to use (default: 1)\n"
+       << "  -T  temp directory to use for disk-based sorting (default: $TMPDIR, else /tmp)\n"
        << "  -m  memory budget in GiB for disk-mode sorting (default: 1.0)\n";
   exit(exit_code);
 }
