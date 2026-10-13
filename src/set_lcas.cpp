@@ -124,7 +124,7 @@ void copy_database_file(const string &source, const string &destination) {
     err(EX_IOERR, "error closing output database %s", destination.c_str());
 }
 
-void validate_database_layout(const KrakenDB &database, size_t db_file_size,
+void validate_database_layout(KrakenDB &database, size_t db_file_size,
                               KrakenDBIndex &index, size_t index_file_size) {
   if (index_file_size < 8)
     errx(EX_DATAERR, "database index is truncated");
@@ -167,6 +167,8 @@ void validate_database_layout(const KrakenDB &database, size_t db_file_size,
       uint64_t key = 0;
       memcpy(&key, pair, database.get_key_len());
       key &= key_mask;
+      if (database.bin_key(key) != bin)
+        errx(EX_DATAERR, "database index does not match database keys");
       if (have_previous_key && key < previous_key)
         errx(EX_DATAERR, "database keys are not sorted within an index bin");
       previous_key = key;
@@ -209,27 +211,30 @@ int main(int argc, char **argv) {
   //    return 1;
   //}
 
-  if (!Output_DB_filename.empty() && !Pretend)
-    copy_database_file(DB_filename, Output_DB_filename);
-  if (!Output_DB_filename.empty() && !Pretend)
-    DB_filename = Output_DB_filename;
-
-  int db_lock_fd = open(DB_filename.c_str(), O_RDWR);
+  const bool write_to_output = !Output_DB_filename.empty() && !Pretend;
+  const string active_db_filename =
+      write_to_output ? Output_DB_filename : DB_filename;
+  int db_lock_fd = open(active_db_filename.c_str(),
+                        O_RDWR | (write_to_output ? O_CREAT : 0), 0666);
   if (db_lock_fd < 0)
-    err(EX_OSERR, "unable to open database %s", DB_filename.c_str());
+    err(EX_OSERR, "unable to open database %s", active_db_filename.c_str());
   if (flock(db_lock_fd, LOCK_EX | LOCK_NB) < 0)
-    err(EX_OSERR, "unable to lock database %s", DB_filename.c_str());
+    err(EX_OSERR, "unable to lock database %s", active_db_filename.c_str());
+  if (write_to_output) {
+    copy_database_file(DB_filename, Output_DB_filename);
+    DB_filename = Output_DB_filename;
+  }
 
   QuickFile db_file(DB_filename, "rw");
   size_t db_file_size = db_file.size();
+  if (db_file_size < 72)
+    errx(EX_DATAERR, "database is truncated");
   vector<char> dat;
   if (Operate_in_RAM) {
     db_file.close_file();
     dat = slurp_file(DB_filename, db_file_size);
     Database = KrakenDB(dat.data(), db_file_size);
   } else {
-    if (db_file_size < 72)
-      errx(EX_DATAERR, "database is truncated");
     Database = KrakenDB(db_file.ptr(), db_file_size);
   }
 
@@ -239,8 +244,8 @@ int main(int argc, char **argv) {
   if (idx_file.size() < 8)
     errx(EX_DATAERR, "database index is truncated");
   KrakenDBIndex db_index(idx_file.ptr());
-  validate_database_layout(Database, db_file_size, db_index, idx_file.size());
   Database.set_index(&db_index);
+  validate_database_layout(Database, db_file_size, db_index, idx_file.size());
 
   if (One_FASTA_file)
     process_single_file();
