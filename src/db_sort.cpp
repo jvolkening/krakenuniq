@@ -386,6 +386,7 @@ static void bin_and_sort_data_disk(KrakenDB &kdb, KrakenDBIndex &idx,
   char *in = NULL, *out = NULL;
   size_t cap = 0;
   uint64_t recs_done = 0;
+  progress_update("sorting", recs_done, key_ct);
   vector<uint64_t> lpos;
   for (size_t g = 0; g < ng; g++) {
     uint64_t lo = gstart[g], hi = gstart[g+1];
