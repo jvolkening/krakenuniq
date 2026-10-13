@@ -54,6 +54,10 @@ KrakenDB::KrakenDB() {
   key_bits = 0;
   k = 0;
   _filesize = 0;
+  _chunks = 0;
+  data = NULL;
+  data_size = 0;
+  data_offset = 0;
 }
 
 // Assumes ptr points to start of a readable mmap'ed file
@@ -61,6 +65,10 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
   _filesize = filesize;
   index_ptr = NULL;
   fptr = ptr;
+  _chunks = 0;
+  data = NULL;
+  data_size = 0;
+  data_offset = 0;
   if (ptr == NULL) {
     errx(EX_DATAERR, "pointer is NULL");
   }
@@ -74,12 +82,13 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
     errx(EX_DATAERR, "can only handle 4 byte DB values");
   k = key_bits / 2;
   key_len = key_bits / 8 + !! (key_bits % 8);
-  std::cerr << "Loaded database with " << key_ct << " keys with k of " << (size_t)k << " [val_len " << val_len << ", key_len " << key_len << "]." << std::endl;
+  std::cerr << "Parsed database header with " << key_ct << " keys with k of " << (size_t)k << " [val_len " << val_len << ", key_len " << key_len << "]." << std::endl;
 }
 
 // destructor
 KrakenDB::~KrakenDB() {
-  munmap(data, data_size);
+  if (data != NULL && data_size > 0)
+    munmap(data, data_size);
 }
 
 size_t KrakenDB::filesize() const {
