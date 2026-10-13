@@ -74,7 +74,7 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
     errx(EX_DATAERR, "can only handle 4 byte DB values");
   k = key_bits / 2;
   key_len = key_bits / 8 + !! (key_bits % 8);
-  std::cerr << "Loaded database with " << key_ct << " keys with k of " << (size_t)k << " [val_len " << val_len << ", key_len " << key_len << "]." << std::endl;
+  std::cerr << "Parsed database header with " << key_ct << " keys with k of " << (size_t)k << " [val_len " << val_len << ", key_len " << key_len << "]." << std::endl;
 }
 
 // destructor

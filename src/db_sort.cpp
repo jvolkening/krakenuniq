@@ -80,8 +80,8 @@ int main(int argc, char **argv) {
   input_db = new KrakenDB(header);
   input_db_file.close_file();  // Stop using memory-mapped file
 
-  cerr << "db_sort: Sorting ..." << endl;
   if (Operate_in_RAM) {
+    cerr << "db_sort: Begin in-memory sorting ..." << endl;
     char *data = new char[ key_ct * (Key_len + val_len) ];
     // Populate data w/ pairs from DB and sort bins in parallel
     bin_and_sort_data_ram(*input_db, data, db_index);
@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
   else {
     // disk-backed: records are partitioned into coarse bin groups in a temp
     // file using large buffered writes, then each group is sorted in memory
+    cerr << "db_sort: Begin disk-backed sorting ..." << endl;
     ofstream output_file(Output_DB_filename.c_str(), std::ofstream::binary);
     if (!output_file.is_open())
       errx(EX_CANTCREAT, "can't open output file %s", Output_DB_filename.c_str());
