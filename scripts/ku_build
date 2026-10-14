@@ -1,0 +1,611 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use 5.012;
+use autodie;
+
+use Cwd qw/abs_path/;
+use Getopt::Long;
+use File::Basename qw/dirname/;
+use File::Copy qw/copy move/;
+use File::Temp;
+use FindBin;
+use Fcntl;
+use IO::Handle;
+use IPC::Cmd qw/can_run/;
+use IPC::Run qw/run timeout/;
+use List::Util qw/sum/;
+use POSIX qw/ceil/;
+
+our $NAME = 'ku_build';
+our $VERSION = 0.002;
+
+my $dir_data;
+my $dir_out;
+my $dir_fast_scratch;
+my $dir_big_scratch;
+my $fn_taxdb;
+my $max_size_gb;
+my $count_kmers = 0;
+my $shrink_kmers = 0;
+my $sort_kmers = 0;
+my $set_lcas = 0;
+my $work_in_memory = 0;
+my $non_overlapping = 0;
+my $fn_compress;
+my $kmer_len = 31;
+my $minimizer_len = 15;
+my $validate = 0;
+
+GetOptions(
+    'data=s' => \$dir_data,
+    'out=s' => \$dir_out,
+    'tmp_fast=s' => \$dir_fast_scratch,
+    'tmp_big=s' => \$dir_big_scratch,
+    'taxdb=s' => \$fn_taxdb,
+    'count' => \$count_kmers,
+    'shrink' => \$shrink_kmers,
+    'sort' => \$sort_kmers,
+    'set_lcas' => \$set_lcas,
+    'validate' => \$validate,
+    'max_size=s' => \$max_size_gb,
+    'work_in_memory' => \$work_in_memory,
+    'non_overlapping' => \$non_overlapping,
+    'compress_to=s' => \$fn_compress,
+    'k=i' => \$kmer_len,
+    'minimizer=i' => \$minimizer_len,
+);
+
+# if no specific step was requested, do everything
+my $do_all = 
+    ! $count_kmers
+    && ! $shrink_kmers
+    && ! $sort_kmers
+    && ! $set_lcas;
+
+die "Validation (--validate) not compatible with partial builds\n"
+    if ($validate && ! $do_all);
+die "DB compression (--compress_to) not compatible with partial builds\n"
+    if (defined $fn_compress && ! $do_all);
+die "Must specify at least one existing tmp directory (--tmp_fast and/or --tmp_big)\n"
+    if (
+        ! defined $dir_fast_scratch
+        || ! -d $dir_fast_scratch
+        || ! defined $dir_big_scratch
+        || ! -d $dir_big_scratch
+    );
+
+# set some initial static values
+my $KRAKEN_DIR = locate_install();
+my $JELLYFISH_BIN = locate_jellyfish();
+my $HASH_SIZE = calc_hash_size();
+my $THREADS = calc_threads();
+
+
+# we'll use the same file naming as build_db.sh
+my $KMERS_UNSORTED = sprintf( "%s/%s", $dir_out, 'database.jdb' );
+my $KMERS_SHRUNK = sprintf( "%s/%s", $dir_out, 'shrunk.jdb' );
+my $KMERS_SORTED = sprintf( "%s/%s", $dir_out, 'database0.kdb' );
+my $INDEX = sprintf( "%s/%s", $dir_out, 'database.idx' );
+my $LCAS = sprintf( "%s/%s", $dir_out, 'database.kdb' );
+my $COUNTS = sprintf( "%s/%s", $dir_out, 'database.kdb.counts' );
+
+my %regex = (
+    FASTA => '.*\/.*\.(fna|fa|fas|fsa|fasta)(\.gz)?$',
+    MAP => '.*\/.*\.(fna|fa|fas|fsa|fasta)(\.gz)?\.map$',
+);
+
+warn "Gathering inputs\n";
+my $FASTA_INPUTS = gather_inputs($dir_data, 'FASTA');
+my $MAP_INPUTS = gather_inputs($dir_data, 'MAP');
+
+# The following blocks comprise the main program logic. Each part of the
+# database is built when needed or requested.
+my ($do_count, $do_shrink, $do_sort, $do_lcas) = calculate_logic();
+
+# Step 1: k-mer counting
+count_kmers( $FASTA_INPUTS, $KMERS_UNSORTED )
+    if ($do_count);
+
+# step 2: db shrink (if needed/requested)
+shrink_kmers( $KMERS_UNSORTED, $KMERS_SHRUNK )
+    if ($do_shrink);
+
+# step 3: db sorting
+sort_kmers( $KMERS_SHRUNK, $KMERS_SORTED )
+    if ($do_sort);
+
+# steps 4-6 (now single step): compile full ID map, build taxDB, run set_lcas
+set_lcas( $KMERS_SORTED, $INDEX, $LCAS, $COUNTS, $FASTA_INPUTS )
+    if ($do_lcas);
+
+validate($FASTA_INPUTS)
+    if ($validate);
+
+# step 7: compress final DB
+compress_db($fn_compress)
+    if (defined $fn_compress);
+
+exit;
+
+
+sub pick_tmp {
+
+    my ($bytes_needed) = @_;
+
+    my $big_enough;
+    if (free_disk_space($dir_fast_scratch) >= $bytes_needed) {
+        return File::Temp->newdir(DIR => $dir_fast_scratch);
+    }
+    elsif (free_disk_space($dir_big_scratch) >= $bytes_needed) {
+        return File::Temp->newdir(DIR => $dir_big_scratch);
+    }
+    return;
+
+}
+
+sub compress_db {
+
+    my ($fn_out) = @_;
+
+    my $start = time;
+    warn "Compressing DB...\n";
+    my $tmp = pick_tmp(-s $LCAS)
+        // die "No scratch big enough to use for compression\n";
+    my $fn_tmp = "$tmp/db_compressed";
+    my $stderr;
+    my @cmd = (
+        'tar',
+        '-I' => "zstd -19 -T$THREADS",
+        '-cf' => $fn_tmp,
+        $LCAS,
+        $COUNTS,
+        $INDEX,
+    );
+ 
+    my $res = run \@cmd, '2>', \$stderr;
+    die "compression failed:\n$stderr"
+        if (! $res);
+    die "Missing compressed output"
+        if (! -r $fn_tmp);
+    move $fn_tmp, $fn_out;
+
+    my $elapsed = time - $start;
+    warn "Done compressing database (took $elapsed s)\n";
+
+}
+
+sub set_lcas {
+
+    my ($fn_in, $fn_in_index, $fn_out, $fn_out_counts, $fns_fa) = @_;
+
+    my $start = time;
+    warn "Calculating LCAs...\n";
+    my $tmp = File::Temp->newdir(DIR => $dir_fast_scratch);
+
+    # merge all tax maps
+    my $map_tmp = "$tmp/map_tmp";
+    my ($ok, $err) = stream_inputs($MAP_INPUTS, '>', $map_tmp);
+    if (! $ok) {
+        unlink $map_tmp;
+        die "Failed to compile full ID map:\n$err";
+    }
+
+    my $fn_tmp = "$tmp/lcas_tmp";
+    my $fn_tmp_c = "$tmp/counts_tmp";
+    my $stderr;
+    my @cmd = (
+        "$KRAKEN_DIR/set_lcas",
+        ($work_in_memory ? '-M' : ''),
+        '-x',
+        '-d' => $fn_in,
+        '-o' => $fn_tmp,
+        '-i' => $fn_in_index,
+        '-b' => $fn_taxdb,
+        '-B' => int(total_memory() / 2**30 * .5),
+        '-t' => $THREADS,
+        '-m' => $map_tmp,
+        '-c' => $fn_tmp_c,
+        '-F' => '/dev/stdin',
+        '-T',
+    );
+
+    ($ok, $err) = stream_inputs($fns_fa, '|', \@cmd);
+    die "set_lcas failed:\n$err"
+        if (! $ok);
+    die "Missing sorted output"
+        if (! -r $fn_tmp);
+    move $fn_tmp, $fn_out;
+    move $fn_tmp_c, $fn_out_counts;
+    unlink $fn_in;
+
+    my $elapsed = time - $start;
+    warn "Done setting LCAs (took $elapsed s)\n";
+
+}
+
+sub sort_kmers {
+
+    my ($fn_unsorted, $fn_sorted) = @_;
+
+    my $start = time;
+    warn "Sorting DB...\n";
+    my $tmp = pick_tmp((-s $fn_unsorted) + 8*2**30)
+        // die "No scratch big enough to use for sorting\n";
+    my $fn_tmp = "$tmp/jfdb_sorted";
+    my $fn_tmp_i = "$tmp/jfdb_index";
+    my $stderr;
+    my @cmd = (
+        "$KRAKEN_DIR/db_sort",
+        '-z',
+        ($work_in_memory ? '-M' : ''),
+        '-t' => $THREADS,
+        '-T' => "$tmp",
+        '-m' => int(total_memory() / 2**30 * .8),
+        '-n' => $minimizer_len,
+        '-d' => $fn_unsorted,
+        '-o' => $fn_tmp,
+        '-i' => $fn_tmp_i,
+    );
+    my $res = run \@cmd, '2>', \$stderr;
+    die "db_sort failed:\n$stderr"
+        if (! $res);
+    die "Missing sorted output"
+        if (! -r $fn_tmp);
+    move $fn_tmp, $fn_sorted;
+    move $fn_tmp_i, $INDEX;
+    unlink $fn_unsorted;
+
+    my $elapsed = time - $start;
+    warn "Done sorting kmers (took $elapsed s)\n";
+
+}
+
+sub shrink_kmers {
+
+    my ($fn_in, $fn_out) = @_;
+
+    my $start = time;
+    warn "Shrinking DB if needed...\n";
+
+    if (! defined $max_size_gb
+        || db_size_gb($fn_in) <= $max_size_gb
+    ) {
+        move $fn_in, $fn_out;
+        warn "No need to shrink, copied DB as-in\n";
+        return;
+    }
+
+    # calculate record length from kmer database
+    open my $in, '<:raw', $fn_in;
+    my $key_bits = read_int8($in, 8);
+    my $val_len = read_int8($in, 16);
+    my $key_cnt = read_int8($in, 48);
+    my $key_len = ceil($key_bits/8);
+    my $rec_len = $key_len + $val_len;
+    my $idx_size = 8 * (4 ** $minimizer_len + 2); 
+    my $max_kdb_size = $max_size_gb * 2**30 - $idx_size;
+    my $new_cnt = int( $max_kdb_size / $rec_len );
+    die "--max_size too small to fit even index"
+        if ($new_cnt < 1);
+
+    my $frac = sprintf "%0.1f%%", $new_cnt/$key_cnt * 100;
+
+    my $tmp = pick_tmp($max_kdb_size)
+        // die "No scratch big enough to use for shrinking\n";
+    my $fn_shrunk = "$tmp/jfdb_shrunk";
+    my $stderr;
+    my @cmd = (
+        "$KRAKEN_DIR/db_shrink",
+        '-d' => $fn_in,
+        '-o' => $fn_shrunk,
+        '-n' => $new_cnt
+    );
+    my $res = run \@cmd, '2>', \$stderr;
+    die "db_shrink failed:\n$stderr"
+        if (! $res);
+    die "Missing shrunken output"
+        if (! -r $fn_shrunk);
+    move $fn_shrunk, $fn_out;
+    unlink $fn_in;
+
+    my $elapsed = time - $start;
+    warn "Done shrinking kmers (took $elapsed s)\n";
+
+}
+
+sub read_int8 {
+
+    my ($fh, $offset) = @_;
+    seek $fh, $offset, SEEK_SET;
+    my $r = read $fh, my $buf, 8;
+    die "Failed to read int8"
+        if ($r != 8);
+    return unpack "Q", $buf;
+
+}
+
+sub db_size_gb {
+
+    my ($fn_kdb) = @_;
+    my $kdb_size = -s $fn_kdb;
+    my $idx_size = 8 * (4 ** $minimizer_len + 2); 
+    return int( ($kdb_size + $idx_size) / (2**30) );
+
+}
+
+
+sub count_kmers {
+
+    my ($fns, $fn_out) = @_;
+
+    my $start = time;
+    warn "Counting kmers...\n";
+
+    # We have no way at this early stage to know how much disk space is
+    # needed, so start with the biggest scratch space available and hope for
+    # the best
+    my $tmp = File::Temp->newdir(DIR => $dir_big_scratch);
+
+    my @cmd = (
+        $JELLYFISH_BIN,
+        'count',
+        '-m' => $kmer_len,
+        '-s' => $HASH_SIZE,
+        '-C',
+        '-t' => $THREADS,
+        '-o' => "$tmp/jfdb_tmp",
+        '/dev/stdin',
+    );
+    my ($ok, $err) = stream_inputs($fns, '|', \@cmd);
+
+    if (! $ok) {
+        unlink $fn_out if (-e $fn_out);
+        die "Error during k-mer counting:\n$err";
+    }
+    my @parts = glob "$tmp/jfdb_tmp*";
+    if (scalar @parts < 1) {
+        die "No jellyfish output parts found (internal error!)"
+    }
+    elsif (scalar @parts == 1) {
+        move $parts[0], $fn_out;
+    }
+    else {
+        my $size_needed_direct = sum map {-s $_} @parts;
+        my $size_needed_sequential = 1.5 * sum map {-s $_} @parts[0..1];
+        my $direct_merge = 0;
+        my $tmp = pick_tmp($size_needed_direct);
+        if (defined $tmp) {
+            $direct_merge = 1;
+            warn "Merging kmer counts via direct merge\n";
+        }
+        else {
+            $tmp = pick_tmp($size_needed_sequential);
+            if (defined $tmp) {
+                $direct_merge = 0;
+                warn "Merging kmer counts via sequential merge\n";
+            }
+            else {
+                die "No available work space is big enough to merge jellyfish parts, giving up.";
+            }
+        }
+            
+        my $fn_merged = "$tmp/jfdb_merged";
+        my @current_fns = $direct_merge
+            ? (splice @parts, 0)
+            : (splice @parts, 0, 2);
+        while (1) {
+            my @cmd = (
+                $JELLYFISH_BIN,
+                'merge',
+                '-o' => "$fn_merged.t",
+                @current_fns,
+            );
+            my $stderr;
+            my $res = run \@cmd, '2>', \$stderr;
+            die "jellyfish merged failed:\n$stderr"
+                if (! $res);
+            die "Missing merged jellyfish output"
+                if (! -r "$fn_merged.t");
+            move "$fn_merged.t", $fn_merged;
+            unlink $_ for (@current_fns);
+            last if (! scalar @parts);
+            @current_fns = ($fn_merged, shift @parts);
+        }
+        move $fn_merged, $fn_out;
+    }
+
+    my $elapsed = time - $start;
+    warn "Done counting kmers (took $elapsed s)\n";
+
+}
+
+sub stream_inputs {
+
+    my ($fns, @chain) = @_;
+
+    my @zcat_null = (
+        'xargs', '-0',
+        'zcat', '-f'
+    );
+
+    my $stderr;
+    my $res = run(
+        \@zcat_null,
+        '<',
+        \$fns,
+        @chain,
+        #'2>',
+        #\$stderr,
+    );
+    return ($res, $stderr);
+
+}
+
+sub gather_inputs {
+
+    # NOTE: shell `find` is ~ 10x faster than File::Find
+
+    my ($dir, $type) = @_;
+    my $re = $regex{$type}
+        // die "No regex defined for type $type";
+    my @cmd = (
+        'find',
+        $dir,
+        '-type' => 'f',
+        '-regextype' => 'posix-extended',
+        '-regex' => $re,
+        '-print0',
+    );
+    open my $stream, '-|', @cmd;
+    my $ret = <$stream>;
+    close $stream
+        or die "Error searching for $type files: $!";
+    die "No inputs of type $type found!"
+        if (! length $ret);
+    return $ret;
+
+}
+
+sub is_fasta {
+
+    my ($fns) = @_;
+
+    return if (-d $_);
+    return if ($_ !~ /.+\.(fa|fsa|fasta|fna)(\.gz)?$/);
+    push @$fns, $_;
+
+}    
+
+sub locate_install {
+
+    my $KRAKENUNIQ_BUILD = can_run 'krakenuniq-build'
+        // die "KrakenUniq tools must be in PATH to use this script\n";
+    die "Unexpected installation structure (no symlink found)"
+        if (! -l $KRAKENUNIQ_BUILD);
+    return dirname(abs_path($KRAKENUNIQ_BUILD));
+
+}
+
+sub locate_jellyfish {
+
+    my $JF = can_run 'jellyfish'
+        // die "Jellyfish must be in PATH to use this script\n";
+    open my $in, '-|', $JF, '-V';
+    my $v_string = <$in>;
+    close $in
+        or die "Unknown error fetching jellyfish version";
+    if ($v_string !~ /^jellyfish 1\.1\.\d+$/) {
+        die "Requires jellyfish version 1.1.x; check your PATH to ensure
+        correct version is being used";
+    }
+    return $JF;
+
+}
+
+sub calc_hash_size {
+
+    return int(total_memory() / 8 * 0.9);
+
+}
+
+sub total_memory {
+
+    die "System must support /proc/meminfo"
+        if (! -r '/proc/meminfo');
+    open my $stream, '<', '/proc/meminfo';
+    my $total;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my ($key, $value, $units) = split ' ', $line;
+        next if ($key ne 'MemTotal:');
+        die "Expected /proc/meminfo to report kB"
+            if ($units ne 'kB');
+        die "MemTotal value ($value) does not appear numeric"
+            if ($value !~ /^\d+$/);
+        $total = $value * 1024;
+        last;
+    }
+    close $stream
+        or die "Error reading from /proc/meminfo: $!";
+    die "Failed to parse available memory from proc/meminfo"
+        if (! defined $total);
+    return $total;
+
+}
+
+sub calc_threads {
+
+    die "System must support /proc/cpuinfo"
+        if (! -r '/proc/cpuinfo');
+    my $n_cpus;
+    open my $stream, '<', '/proc/cpuinfo';
+    while (my $line = <$stream>) {
+        chomp $line;
+        if ($line =~ /^processor\s*: (\d+)$/) {
+            $n_cpus = $1 + 1;
+        }
+    }
+    close $stream
+        or die "Error reading from /proc/cpuinfo: $!";
+    die "Failed to parse CPU count from /proc/cpuinfo"
+        if (! defined $n_cpus);
+    return $n_cpus;
+
+}
+
+sub free_disk_space {
+
+    my ($dir) = @_;
+
+    open my $cmd, '-|',
+        'df', '-P', $dir;
+    my $h = <$cmd>;
+    chomp $h;
+    my @f = split ' ', $h;
+    die "Error parsing disk space"
+        if ($f[0] ne 'Filesystem');
+    die "Error parsing disk space"
+        if ($f[1] ne '1024-blocks');
+    die "Error parsing disk space"
+        if ($f[3] ne 'Available');
+    my $l = <$cmd>;
+    chomp $l;
+    @f = split ' ', $l;
+
+    my $free = $f[3];
+    die "Error parsing disk space: unexpected value $free"
+        if ($free !~ /^\d+$/);
+    return $free * 1024;
+
+}
+sub calculate_logic {
+
+    # first, honor user requests
+    my $do_count = $count_kmers;
+    my $do_shrink = $shrink_kmers;
+    my $do_sort = $sort_kmers;
+    my $do_lcas = $set_lcas;
+
+    # then, update based on dependency chain
+    $do_lcas = 1 if (
+        ($do_all || $do_lcas)
+        && (! -e $LCAS || ! -s $LCAS)
+    );
+    $do_sort = 1 if (
+        ($do_lcas || $do_sort)
+        && (! -e $KMERS_SORTED || ! -s $KMERS_SORTED)
+    );
+    $do_shrink = 1 if (
+        ($do_sort || $do_shrink)
+        && (! -e $KMERS_SHRUNK || ! -s $KMERS_SHRUNK)
+    );
+    $do_count = 1 if (
+        ($do_shrink || $do_count)
+        && (! -e $KMERS_UNSORTED || ! -s $KMERS_UNSORTED)
+    );
+
+    return ($do_count, $do_shrink, $do_sort, $do_lcas);
+
+}
