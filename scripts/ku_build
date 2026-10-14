@@ -609,3 +609,96 @@ sub calculate_logic {
     return ($do_count, $do_shrink, $do_sort, $do_lcas);
 
 }
+
+sub validate {
+
+    require BioX::Tax::Kraken;
+
+    my $tax = BioX::Tax::Kraken->new($fn_taxdb);
+
+    my $start = time;
+    warn "Validating DB against inputs...\n";
+
+    my $tmp = File::Temp->newdir(DIR => $dir_big_scratch);
+    my $fn_in = "$tmp/all.fa";
+    my $fn_map = "$tmp/all.fa.map";
+    my ($ok, $err) = stream_inputs($FASTA_INPUTS, '>', $fn_in);
+    if (! $ok) {
+        unlink $fn_in;
+        die "Failed to compile full FASTA input:\n$err";
+    }
+    ($ok, $err) = stream_inputs($MAP_INPUTS, '>', $fn_map);
+    if (! $ok) {
+        unlink $fn_map;
+        die "Failed to compile full map input:\n$err";
+    }
+
+    # parse known tax IDs
+    my %mapped;
+    open my $in, '<', $fn_map;
+    while (my $line = <$in>) {
+        chomp $line;
+        my ($acc, $tid, @other) = split "\t", $line;
+        $mapped{$acc} = $tid;
+    }
+    close $in;
+
+    my %status_counts = (
+        'match' => 0,
+        'parent' => 0,
+        'mismatch' => 0,
+        'unclassified' => 0,
+    );
+    my $tdb = "$dir_out/taxDB";
+    copy $fn_taxdb, $tdb;
+    my @cmd = (
+        'krakenuniq',
+        '--db' => $dir_out,
+        '--threads' => $THREADS,
+        '--preload-size' => int(total_memory() * .8),
+        $fn_in,
+    );
+    my $stdout;
+    my $stderr;
+    my $res = run \@cmd, '>', \$stdout, '2>', \$stderr;
+    die "krakenuniq failed:\n$stderr"
+        if (! $res);
+    unlink $tdb;
+
+    open my $stream, '<', \$stdout;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my ($status, $acc, $tid, @other) = split "\t", $line;
+        ++$status_counts{total};
+        if ($status ne 'C') {
+            ++$status_counts{unclassified};
+        }
+        elsif ($tid eq $mapped{$acc}) {
+            ++$status_counts{match}
+        }
+        elsif ($tax->is_ancestor($mapped{$acc}, $tid)) {
+            ++$status_counts{parent}
+        }
+        else {
+            ++$status_counts{mismatch}
+        }
+    }
+    close $stream;
+
+    my $elapsed = time - $start;
+    warn "Done with validating (took $elapsed s)\n";
+    warn sprintf "Matching hits: %s (%0.1f %%)\n",
+        $status_counts{match},
+        $status_counts{match}/$status_counts{total}*100;
+    warn sprintf "Parental hits: %s (%0.1f %%)\n",
+        $status_counts{parent},
+        $status_counts{parent}/$status_counts{total}*100;
+    warn sprintf "Mismatched hits: %s (%0.1f %%)\n",
+        $status_counts{mismatch},
+        $status_counts{mismatch}/$status_counts{total}*100;
+    warn sprintf "Unclassified seqs: %s (%0.1f %%)\n",
+        $status_counts{unclassified},
+        $status_counts{unclassified}/$status_counts{total}*100;
+    return;
+
+}
