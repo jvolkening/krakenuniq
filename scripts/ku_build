@@ -28,7 +28,6 @@ my $dir_big_scratch;
 my $fn_taxdb;
 my $max_size_gb;
 my $count_kmers = 0;
-my $shrink_kmers = 0;
 my $sort_kmers = 0;
 my $set_lcas = 0;
 my $work_in_memory = 0;
@@ -45,7 +44,6 @@ GetOptions(
     'tmp_big=s' => \$dir_big_scratch,
     'taxdb=s' => \$fn_taxdb,
     'count' => \$count_kmers,
-    'shrink' => \$shrink_kmers,
     'sort' => \$sort_kmers,
     'set_lcas' => \$set_lcas,
     'validate' => \$validate,
@@ -60,7 +58,6 @@ GetOptions(
 # if no specific step was requested, do everything
 my $do_all = 
     ! $count_kmers
-    && ! $shrink_kmers
     && ! $sort_kmers
     && ! $set_lcas;
 
@@ -75,6 +72,10 @@ die "Must specify at least one existing tmp directory (--tmp_fast and/or --tmp_b
         || ! defined $dir_big_scratch
         || ! -d $dir_big_scratch
     );
+$dir_fast_scratch //= $dir_big_scratch;
+$dir_big_scratch //= $dir_fast_scratch;
+
+$ENV{TMPDIR} = $dir_big_scratch;
 
 # set some initial static values
 my $KRAKEN_DIR = locate_install();
@@ -83,17 +84,15 @@ my $HASH_SIZE = calc_hash_size();
 my $THREADS = calc_threads();
 
 
-# we'll use the same file naming as build_db.sh
-my $KMERS_UNSORTED = sprintf( "%s/%s", $dir_out, 'database.jdb' );
 my $KMERS_SHRUNK = sprintf( "%s/%s", $dir_out, 'shrunk.jdb' );
-my $KMERS_SORTED = sprintf( "%s/%s", $dir_out, 'database0.kdb' );
+my $KMERS_SORTED = sprintf( "%s/%s", $dir_out, 'sorted.kdb' );
 my $INDEX = sprintf( "%s/%s", $dir_out, 'database.idx' );
 my $LCAS = sprintf( "%s/%s", $dir_out, 'database.kdb' );
 my $COUNTS = sprintf( "%s/%s", $dir_out, 'database.kdb.counts' );
 
 my %regex = (
-    FASTA => '.*\/.*\.(fna|fa|fas|fsa|fasta)(\.gz)?$',
-    MAP => '.*\/.*\.(fna|fa|fas|fsa|fasta)(\.gz)?\.map$',
+    FASTA => '.*\/.*\.(fasta|fa|fas|fsa|fna)(\.gz)?$',
+    MAP => '.*\/.*\.(fasta|fa|fas|fsa|fna)(\.gz)?\.map$',
 );
 
 warn "Gathering inputs\n";
@@ -102,18 +101,16 @@ my $MAP_INPUTS = gather_inputs($dir_data, 'MAP');
 
 # The following blocks comprise the main program logic. Each part of the
 # database is built when needed or requested.
-my ($do_count, $do_shrink, $do_sort, $do_lcas) = calculate_logic();
+my ($do_count, $do_sort, $do_lcas) = calculate_logic();
 
 # Step 1: k-mer counting
-count_kmers( $FASTA_INPUTS, $KMERS_UNSORTED )
-    if ($do_count);
-
-# step 2: db shrink (if needed/requested)
-shrink_kmers( $KMERS_UNSORTED, $KMERS_SHRUNK )
-    if ($do_shrink);
+if ($do_count) {
+    my $fn_full = count_kmers( $FASTA_INPUTS );
+    shrink_kmers( $fn_full, $KMERS_SHRUNK );
+}
 
 # step 3: db sorting
-sort_kmers( $KMERS_SHRUNK, $KMERS_SORTED )
+sort_kmers( $KMERS_SHRUNK, $KMERS_SORTED, $INDEX )
     if ($do_sort);
 
 # steps 4-6 (now single step): compile full ID map, build taxDB, run set_lcas
@@ -129,17 +126,28 @@ compress_db($fn_compress)
 
 exit;
 
-
-sub pick_tmp {
+sub pick_tmp_dir {
 
     my ($bytes_needed) = @_;
 
-    my $big_enough;
-    if (free_disk_space($dir_fast_scratch) >= $bytes_needed) {
-        return File::Temp->newdir(DIR => $dir_fast_scratch);
+    for my $d ($dir_fast_scratch, $dir_big_scratch) {
+        return File::Temp->newdir(DIR => $d)
+            if (free_disk_space($d) >= $bytes_needed);
     }
-    elsif (free_disk_space($dir_big_scratch) >= $bytes_needed) {
-        return File::Temp->newdir(DIR => $dir_big_scratch);
+    return;
+
+}
+
+
+sub pick_tmp_file {
+
+    my ($bytes_needed) = @_;
+
+    for my $d ($dir_fast_scratch, $dir_big_scratch) {
+        next if (free_disk_space($d) < $bytes_needed);
+        my $tmp = File::Temp->new(DIR => $d);
+        close $tmp;
+        return $tmp;
     }
     return;
 
@@ -151,14 +159,19 @@ sub compress_db {
 
     my $start = time;
     warn "Compressing DB...\n";
-    my $tmp = pick_tmp(-s $LCAS)
+    my $tmp = pick_tmp_file(-s $LCAS)
         // die "No scratch big enough to use for compression\n";
-    my $fn_tmp = "$tmp/db_compressed";
+    for my $fn ($LCAS, $COUNTS, $INDEX) {
+        die "Missing final DB file $fn"
+            if (! -e $fn);
+        die "Empty final DB file $fn"
+            if (! -s $fn);
+    }
     my $stderr;
     my @cmd = (
         'tar',
         '-I' => "zstd -19 -T$THREADS",
-        '-cf' => $fn_tmp,
+        '-cf' => "$tmp",
         $LCAS,
         $COUNTS,
         $INDEX,
@@ -168,8 +181,9 @@ sub compress_db {
     die "compression failed:\n$stderr"
         if (! $res);
     die "Missing compressed output"
-        if (! -r $fn_tmp);
-    move $fn_tmp, $fn_out;
+        if (! -r "$tmp");
+    move_with_check("$tmp", "$fn_out")
+        or die "Error moving compressed DB to final location: $@";
 
     my $elapsed = time - $start;
     warn "Done compressing database (took $elapsed s)\n";
@@ -216,8 +230,10 @@ sub set_lcas {
         if (! $ok);
     die "Missing sorted output"
         if (! -r $fn_tmp);
-    move $fn_tmp, $fn_out;
-    move $fn_tmp_c, $fn_out_counts;
+    move_with_check("$fn_tmp", "$fn_out")
+        or die "Error moving LCAs to final location: $@";
+    move_with_check("$fn_tmp_c", "$fn_out_counts")
+        or die "Error moving counts to final location: $@";
     unlink $fn_in;
 
     my $elapsed = time - $start;
@@ -227,11 +243,12 @@ sub set_lcas {
 
 sub sort_kmers {
 
-    my ($fn_unsorted, $fn_sorted) = @_;
+    my ($fn_unsorted, $fn_sorted, $fn_index) = @_;
 
     my $start = time;
     warn "Sorting DB...\n";
-    my $tmp = pick_tmp((-s $fn_unsorted) + 8*2**30)
+
+    my $tmp = pick_tmp_dir(((-s $fn_unsorted)*2) + 12*2**30)
         // die "No scratch big enough to use for sorting\n";
     my $fn_tmp = "$tmp/jfdb_sorted";
     my $fn_tmp_i = "$tmp/jfdb_index";
@@ -248,13 +265,15 @@ sub sort_kmers {
         '-o' => $fn_tmp,
         '-i' => $fn_tmp_i,
     );
-    my $res = run \@cmd, '2>', \$stderr;
-    die "db_sort failed:\n$stderr"
+    my $res = run \@cmd;
+    die "db_sort failed:\n$1"
         if (! $res);
     die "Missing sorted output"
         if (! -r $fn_tmp);
-    move $fn_tmp, $fn_sorted;
-    move $fn_tmp_i, $INDEX;
+    move_with_check("$fn_tmp", "$fn_sorted")
+        or die "Error moving sorted DB to final location";
+    move_with_check("$fn_tmp_i", "$fn_index")
+        or die "Error moving index to final location";
     unlink $fn_unsorted;
 
     my $elapsed = time - $start;
@@ -272,13 +291,14 @@ sub shrink_kmers {
     if (! defined $max_size_gb
         || db_size_gb($fn_in) <= $max_size_gb
     ) {
-        move $fn_in, $fn_out;
-        warn "No need to shrink, copied DB as-in\n";
+        warn "No need to shrink, copying DB as-in\n";
+        move_with_check("$fn_in", "$fn_out")
+            or die "Error moving DB to final location: $@";
         return;
     }
 
     # calculate record length from kmer database
-    open my $in, '<:raw', $fn_in;
+    open my $in, '<:raw', "$fn_in";
     my $key_bits = read_int8($in, 8);
     my $val_len = read_int8($in, 16);
     my $key_cnt = read_int8($in, 48);
@@ -291,27 +311,37 @@ sub shrink_kmers {
         if ($new_cnt < 1);
 
     my $frac = sprintf "%0.1f%%", $new_cnt/$key_cnt * 100;
+    warn "Shrinking DB to use $new_cnt of $key_cnt kmers ($frac)\n";
 
-    my $tmp = pick_tmp($max_kdb_size)
+    my $tmp = pick_tmp_file($max_kdb_size)
         // die "No scratch big enough to use for shrinking\n";
-    my $fn_shrunk = "$tmp/jfdb_shrunk";
     my $stderr;
     my @cmd = (
         "$KRAKEN_DIR/db_shrink",
-        '-d' => $fn_in,
-        '-o' => $fn_shrunk,
+        '-d' => "$fn_in",
+        '-o' => "$tmp",
         '-n' => $new_cnt
     );
     my $res = run \@cmd, '2>', \$stderr;
     die "db_shrink failed:\n$stderr"
         if (! $res);
     die "Missing shrunken output"
-        if (! -r $fn_shrunk);
-    move $fn_shrunk, $fn_out;
-    unlink $fn_in;
+        if (! -r "$tmp");
+    move_with_check("$tmp", "$fn_out")
+        or die "Error moving shrunk DB to final location: $@";
+    unlink "$fn_in";
 
     my $elapsed = time - $start;
     warn "Done shrinking kmers (took $elapsed s)\n";
+
+}
+
+sub move_with_check {
+
+    my ($from, $to) = @_;
+    die "Not enough disk space to move to $to"
+        if (free_disk_space(dirname($to)) < -s $from);
+    return move $from, $to;
 
 }
 
@@ -329,7 +359,7 @@ sub read_int8 {
 sub db_size_gb {
 
     my ($fn_kdb) = @_;
-    my $kdb_size = -s $fn_kdb;
+    my $kdb_size = -s "$fn_kdb";
     my $idx_size = 8 * (4 ** $minimizer_len + 2); 
     return int( ($kdb_size + $idx_size) / (2**30) );
 
@@ -338,14 +368,14 @@ sub db_size_gb {
 
 sub count_kmers {
 
-    my ($fns, $fn_out) = @_;
+    my ($fns) = @_;
 
     my $start = time;
     warn "Counting kmers...\n";
 
     # We have no way at this early stage to know how much disk space is
     # needed, so start with the biggest scratch space available and hope for
-    # the best
+    # the best. Work in the "big scratch" space for this entire process.
     my $tmp = File::Temp->newdir(DIR => $dir_big_scratch);
 
     my @cmd = (
@@ -361,63 +391,65 @@ sub count_kmers {
     my ($ok, $err) = stream_inputs($fns, '|', \@cmd);
 
     if (! $ok) {
-        unlink $fn_out if (-e $fn_out);
         die "Error during k-mer counting:\n$err";
     }
     my @parts = glob "$tmp/jfdb_tmp*";
+    my $n_parts = scalar @parts;
     if (scalar @parts < 1) {
-        die "No jellyfish output parts found (internal error!)"
+        die "Internal error: No jellyfish output parts found"
     }
-    elsif (scalar @parts == 1) {
-        move $parts[0], $fn_out;
+    my $tmp_merged = File::Temp->new(DIR => $dir_big_scratch);
+    close $tmp_merged;
+     
+    if (scalar @parts == 1) {
+        warn "No merge needed, copying counts to output";
+        move_with_check("$parts[0]", "$tmp_merged")
+            or die "Error moving single jellyfish file: $@";
     }
     else {
-        my $size_needed_direct = sum map {-s $_} @parts;
-        my $size_needed_sequential = 1.5 * sum map {-s $_} @parts[0..1];
-        my $direct_merge = 0;
-        my $tmp = pick_tmp($size_needed_direct);
-        if (defined $tmp) {
-            $direct_merge = 1;
-            warn "Merging kmer counts via direct merge\n";
-        }
-        else {
-            $tmp = pick_tmp($size_needed_sequential);
-            if (defined $tmp) {
-                $direct_merge = 0;
-                warn "Merging kmer counts via sequential merge\n";
-            }
-            else {
-                die "No available work space is big enough to merge jellyfish parts, giving up.";
-            }
-        }
-            
-        my $fn_merged = "$tmp/jfdb_merged";
-        my @current_fns = $direct_merge
-            ? (splice @parts, 0)
-            : (splice @parts, 0, 2);
+        my @curr_fns;
+        my $curr_size = 0;
+        my $total_added = 0;
         while (1) {
+            $curr_size = sum map {-s "$_"} @curr_fns;
+            my $added = 0;
+            while (scalar @parts
+                && $curr_size + (-s "$parts[0]") < free_disk_space("$tmp_merged")*0.95) {
+                push @curr_fns, shift @parts;
+                $curr_size += -s "$curr_fns[-1]";
+                ++$added;
+            }
+            if (! $added) {
+                die "Not enough remaining free space to complete merge!";
+            }
+            $total_added += $added;
             my @cmd = (
                 $JELLYFISH_BIN,
                 'merge',
-                '-o' => "$fn_merged.t",
-                @current_fns,
+                '-o' => "$tmp_merged",
+                @curr_fns,
             );
             my $stderr;
             my $res = run \@cmd, '2>', \$stderr;
-            die "jellyfish merged failed:\n$stderr"
-                if (! $res);
+            if (! $res) {
+                die "jellyfish merged failed:\n$stderr"
+            }
             die "Missing merged jellyfish output"
-                if (! -r "$fn_merged.t");
-            move "$fn_merged.t", $fn_merged;
-            unlink $_ for (@current_fns);
+                if (! -r "$tmp_merged");
+            unlink $_ for (@curr_fns);
             last if (! scalar @parts);
-            @current_fns = ($fn_merged, shift @parts);
+            @curr_fns = ($tmp_merged);
+            $tmp_merged = File::Dir->new(DIR => $dir_big_scratch);
+            close $tmp_merged;
         }
-        move $fn_merged, $fn_out;
+        die "Internal error: mismatch between found parts and processed parts"
+            if ($total_added != $n_parts);
     }
 
     my $elapsed = time - $start;
     warn "Done counting kmers (took $elapsed s)\n";
+
+    return $tmp_merged;
 
 }
 
@@ -467,16 +499,6 @@ sub gather_inputs {
     return $ret;
 
 }
-
-sub is_fasta {
-
-    my ($fns) = @_;
-
-    return if (-d $_);
-    return if ($_ !~ /.+\.(fa|fsa|fasta|fna)(\.gz)?$/);
-    push @$fns, $_;
-
-}    
 
 sub locate_install {
 
@@ -584,7 +606,6 @@ sub calculate_logic {
 
     # first, honor user requests
     my $do_count = $count_kmers;
-    my $do_shrink = $shrink_kmers;
     my $do_sort = $sort_kmers;
     my $do_lcas = $set_lcas;
 
@@ -597,16 +618,12 @@ sub calculate_logic {
         ($do_lcas || $do_sort)
         && (! -e $KMERS_SORTED || ! -s $KMERS_SORTED)
     );
-    $do_shrink = 1 if (
-        ($do_sort || $do_shrink)
+    $do_count = 1 if (
+        ($do_sort || $do_count)
         && (! -e $KMERS_SHRUNK || ! -s $KMERS_SHRUNK)
     );
-    $do_count = 1 if (
-        ($do_shrink || $do_count)
-        && (! -e $KMERS_UNSORTED || ! -s $KMERS_UNSORTED)
-    );
 
-    return ($do_count, $do_shrink, $do_sort, $do_lcas);
+    return ($do_count, $do_sort, $do_lcas);
 
 }
 
@@ -650,7 +667,7 @@ sub validate {
         'unclassified' => 0,
     );
     my $tdb = "$dir_out/taxDB";
-    copy $fn_taxdb, $tdb;
+    copy "$fn_taxdb", "$tdb";
     my @cmd = (
         'krakenuniq',
         '--db' => $dir_out,
@@ -658,14 +675,15 @@ sub validate {
         '--preload-size' => int(total_memory() * .8),
         $fn_in,
     );
-    my $stdout;
+    my $stdout = File::Temp->new(DIR => $dir_big_scratch);
     my $stderr;
-    my $res = run \@cmd, '>', \$stdout, '2>', \$stderr;
+    my $res = run \@cmd, '>', "$stdout", '2>', \$stderr;
     die "krakenuniq failed:\n$stderr"
         if (! $res);
     unlink $tdb;
 
-    open my $stream, '<', \$stdout;
+    close $stdout;
+    open my $stream, '<', "$stdout";
     while (my $line = <$stream>) {
         chomp $line;
         my ($status, $acc, $tid, @other) = split "\t", $line;
@@ -676,7 +694,7 @@ sub validate {
         elsif ($tid eq $mapped{$acc}) {
             ++$status_counts{match}
         }
-        elsif ($tax->is_ancestor($mapped{$acc}, $tid)) {
+        elsif ($tax->a_isa_b($mapped{$acc}, $tid)) {
             ++$status_counts{parent}
         }
         else {
@@ -686,7 +704,7 @@ sub validate {
     close $stream;
 
     my $elapsed = time - $start;
-    warn "Done with validating (took $elapsed s)\n";
+    warn "Done with validation (took $elapsed s)\n";
     warn sprintf "Matching hits: %s (%0.1f %%)\n",
         $status_counts{match},
         $status_counts{match}/$status_counts{total}*100;
