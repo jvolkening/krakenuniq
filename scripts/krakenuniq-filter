@@ -25,6 +25,7 @@ use strict;
 use warnings;
 use File::Basename;
 use Getopt::Long;
+use List::Util qw/any/;
 
 my $PROG = basename $0;
 my $KRAKEN_DIR = "#####=KRAKEN_DIR=#####";
@@ -39,12 +40,14 @@ require "$KRAKEN_DIR/krakenlib.pm";
 
 my $threshold = 0;
 my $db_prefix;
+my $denominator = 'unambiguous';
 
 GetOptions(
   "help" => \&display_help,
   "version" => \&display_version,
   "threshold=f" => \$threshold,
   "db=s" => \$db_prefix,
+  "denominator=s" => \$denominator,
 ) or usage();
 
 eval { $db_prefix = krakenlib::find_db($db_prefix); };
@@ -56,6 +59,18 @@ if ($threshold < 0 || $threshold > 1) {
   print STDERR "$PROG: threshold must be in the interval [0,1].\n";
   exit 64;
 }
+
+# check that --denominator is a valid value
+my @enum_denom = qw/
+    all
+    unambiguous
+    assigned
+/;
+if (! any {$denominator eq $_} @enum_denom) {
+  print STDERR "$PROG: Denominator must be one of: @enum_denom.\n";
+  exit 64;
+}
+
 
 sub usage {
   my $exit_code = @_ ? shift : 64;
@@ -122,7 +137,12 @@ while (<>) {
   # starting at called node, run up tree until threshold met
   my $new_taxon = $called_taxon;
   while (defined $parent_map{$new_taxon}) {
-    $pct = $hit_sums{$new_taxon} / $total_unambig;
+    my $denom = $denominator eq 'assigned' ? $total_hits
+              : $denominator eq 'unambiguous' ? $total_unambig
+              : $denominator eq 'all' ? $total_kmers
+              : die "Internal error: invalid value for \$denominator"
+                . " ($denominator)";
+    $pct = $hit_sums{$new_taxon} / $denom;
     if ($pct >= $threshold - 1e-5) {  # epsilon check w/ float equality
       last;
     }
