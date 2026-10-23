@@ -79,7 +79,7 @@ $ENV{TMPDIR} = $dir_big_scratch;
 
 # set some initial static values
 my $KRAKEN_DIR = locate_install();
-my $JELLYFISH_BIN = locate_jellyfish();
+my $JELLYFISH_BIN = locate_jellyfish($KRAKEN_DIR);
 my $HASH_SIZE = calc_hash_size();
 my $THREADS = calc_threads();
 
@@ -487,23 +487,23 @@ sub locate_install {
 
     my $KRAKENUNIQ_BUILD = can_run 'krakenuniq-build'
         // die "KrakenUniq tools must be in PATH to use this script\n";
-    die "Unexpected installation structure (no symlink found)"
-        if (! -l $KRAKENUNIQ_BUILD);
     return dirname(abs_path($KRAKENUNIQ_BUILD));
 
 }
 
 sub locate_jellyfish {
 
-    my $JF = can_run 'jellyfish'
-        // die "Jellyfish must be in PATH to use this script\n";
+    my ($base_path) = @_;
+    my $JF = -e "$base_path/krakenfish" ? "$base_path/krakenfish"
+        : defined can_run('krakenfish') ? can_run('krakenfish')
+        : die "krakenfish (Jellyfish v1 fork) must be in PATH to use this script\n";
     open my $in, '-|', $JF, '-V';
     my $v_string = <$in>;
     close $in
-        or die "Unknown error fetching jellyfish version";
+        or die "Unknown error fetching krakenfish version";
     if ($v_string !~ /^jellyfish 1\.1\.\d+$/) {
-        die "Requires jellyfish version 1.1.x; check your PATH to ensure
-        correct version is being used";
+        die "Requires krakenfish/jellyfish version 1.1.x; check your PATH to"
+            . " ensure correct version is being used";
     }
     return $JF;
 
