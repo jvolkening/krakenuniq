@@ -42,12 +42,14 @@ my $show_zeros = 0;
 my $db_prefix;
 my $is_cnts_table = 0;
 my $is_taxon_list = 0;
+my $abund_sigfigs = 0;
 
 GetOptions(
   "help" => \&display_help,
   "version" => \&display_version,
   "show-zeros" => \$show_zeros,
   "taxon-counts" => \$is_cnts_table,
+  "abundance-sigfigs=i" => \$abund_sigfigs,
   "taxon-list" => \$is_taxon_list,
   "db=s" => \$db_prefix,
 );
@@ -135,7 +137,10 @@ for (keys %name_map) {
   $clade_counts{$_} ||= 0;
 }
 
-printf "%6.2f\t%d\t%d\t%s\t%d\t%s%s\n",
+my $abund_fmt = defined $abund_sigfigs
+    ? "%0.{$abund_sigfigs}g"
+    : "%6.2f";
+printf "$abund_fmt\t%d\t%d\t%s\t%d\t%s%s\n",
   $clade_counts{0} * 100 / $seq_count,
   $clade_counts{0}, $taxo_counts{0}, "U",
   0, "", "unclassified";
@@ -147,7 +152,7 @@ sub dfs_report {
   if (! $clade_counts{$node} && ! $show_zeros) {
     return;
   }
-  printf "%6.2f\t%d\t%d\t%s\t%d\t%s%s\n",
+  printf "$abund_fmt\t%d\t%d\t%s\t%d\t%s%s\n",
     ($clade_counts{$node} || 0) * 100 / $seq_count,
     ($clade_counts{$node} || 0),
     ($taxo_counts{$node} || 0),
