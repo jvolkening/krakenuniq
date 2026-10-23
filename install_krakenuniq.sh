@@ -20,7 +20,7 @@ set -e
 
 DIR=$(dirname $0)
 VERSION=`cat $(dirname $0)/VERSION`
-INSTALL_JELLYFISH=0
+INSTALL_JELLYFISH=1
 MAKE_ARGS=
 MAKE_CLEAN="clean"
 ADD_DEBUG_INFO=0
@@ -30,7 +30,7 @@ USAGE="Usage: $(basename $0) [OPTIONS] INSTALL_DIR
 
 OPTIONS:
     -l BIN_DIR  Link KrakenUniq executables to BIN_DIR, e.g /usr/local/bin or ~/bin.
-    -j          Install jellyfish v1.1 in INSTALL_DIR.
+    -s          Skip building the bundled Jellyfish fork (installed as 'krakenfish').
     -c BIN      Use compiler BIN instead of g++.
     -g          Add debug info
     -h          This help message
@@ -39,12 +39,12 @@ On MacOS, if you experience the error \"clang: fatal error: unsupported option '
 "
 
 
-while getopts "Chjc:gl:" OPTION; do
+while getopts "Chsc:gl:" OPTION; do
     case $OPTION in
     c) MAKE_ARGS="CXX=\"$OPTARG\"" ;;
     C) MAKE_CLEAN="" ;;
     g) ADD_DEBUG_INFO=1 ;;
-    j) INSTALL_JELLYFISH=1 ;;
+    s) INSTALL_JELLYFISH=0 ;;
     l) LINK_DIR="$OPTARG" ;;
     h) echo "$USAGE"; exit 0 ;;
     *) echo "Incorrect options provided. $USAGE"
@@ -73,14 +73,22 @@ export KRAKEN_DIR=$(perl -MCwd=abs_path -le 'print abs_path(shift)' "$1")
 
 mkdir -p "$KRAKEN_DIR"
 if [ "$INSTALL_JELLYFISH" == "1" ]; then
-  (cd $KRAKEN_DIR
-  if [ ! -e jellyfish-install/bin/jellyfish ]; then
-    echo "Installing jellyfish"
-    wget https://github.com/gmarcais/Jellyfish/releases/download/v1.1.12/jellyfish-1.1.12.tar.gz 
-    tar xzf jellyfish-1.1.12.tar.gz && rm -rf jellyfish-1.1.12.tar.gz
-    mv jellyfish-1.1.12 jellyfish-install
-    cd jellyfish-install && ./configure --prefix=$PWD && make -j install || echo "Jellyfish 1 installation failed, building new database may not work properly"
-  fi)
+  if [ ! -x "$KRAKEN_DIR/krakenfish" ]; then
+    echo "Installing krakenfish (bundled Jellyfish fork)"
+    JF_SRC=$(perl -MCwd=abs_path -le 'print abs_path(shift)' "$DIR/external/jellyfish")
+    JF_BUILD=$(mktemp -d)
+    JF_PREFIX="$JF_BUILD/prefix"
+    cp -a "$JF_SRC/." "$JF_BUILD/src" && rm -rf "$JF_BUILD/src/autom4te.cache"
+    (cd "$JF_BUILD/src" \
+      && { [ -x ./configure ] || autoreconf -i; } \
+      && ./configure --prefix="$JF_PREFIX" --disable-shared CXXFLAGS="-O2 -std=gnu++11 -Wno-error" --program-transform-name='s/^jellyfish$/krakenfish/' \
+      && make -j && make install \
+      && if [ -x "$JF_PREFIX/bin/krakenfish" ]; then cp "$JF_PREFIX/bin/krakenfish" "$KRAKEN_DIR/krakenfish";
+         else cp "$JF_PREFIX/bin/jellyfish" "$KRAKEN_DIR/krakenfish"; fi \
+      && chmod +x "$KRAKEN_DIR/krakenfish") \
+      || echo "krakenfish installation failed, building new database may not work properly"
+    rm -rf "$JF_BUILD"
+  fi
 fi
 
 [[ "$ADD_DEBUG_INFO" == 1 ]] && MAKE_ARGS="$MAKE_ARGS NDEBUG=-g"
@@ -108,7 +116,6 @@ if [[ "$LINK_DIR" != "" ]]; then
     for file in $KRAKEN_DIR/krakenuniq*; do
         [ -x "$file" ] && ln -sf $file $LINK_DIR/`basename $file`
     done
-    ln -sf $KRAKEN_DIR/jellyfish-install $LINK_DIR/jellyfish-install
     echo "Linked KrakenUniq files to $LINK_DIR."
 else
     echo "You may want to link KrakenUniq scripts to /usr/bin or another directory for executables, or add the install directory to the PATH environment variable. Main executables: "

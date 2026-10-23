@@ -31,7 +31,7 @@ This is the official 1.0.0 release of KrakenUniq. This release fixes the bug wit
 ## New release v0.7.3
 This maintenance release provides the following updates: 
 (1) fixes issues with building large databases
-(2) installs Jellyfish version 1 under KRAKENUNIQ_INSTALL_DIR/jellyfish-install/bin/, if -j switch is used (KrakenUniq requires Jellyfish version 1 to build databases)
+(2) builds the bundled Jellyfish fork (`external/jellyfish`) and installs it as `KRAKENUNIQ_INSTALL_DIR/krakenfish`, unless the -s switch is used (KrakenUniq requires Jellyfish version 1 to build databases)
 (3) fixes --work-on-disk option (#97)
 
 ## New release v0.7.2
@@ -90,7 +90,7 @@ cd krakenuniq
 ./install_krakenuniq /PATH/TO/INSTALL_DIR
 ```
 
-KrakenUniq requires Jellyfish version 1.x.x to be installed for the database building step (`krakenuniq-build`). Starting with v0.7.3, krakenuniq will download and install jellyfish v1.1.12 automatically by default. To skip installing Jellyfish use the `-s` flag for the `install_krakenuniq.sh` script. Alternatively, you can specify the Jellyfish path to `krakenuniq-build` with `krakenuniq-build --jellyfish-bin /usr/bin/jellyfish1`.
+KrakenUniq requires Jellyfish version 1.x.x to be installed for the database building step (`krakenuniq-build`). A Jellyfish fork is vendored under `external/jellyfish`; `install_krakenuniq.sh` builds it and installs the executable as `krakenfish` in the installation directory (renamed to avoid conflicts with a system `jellyfish`). To skip building it use the `-s` flag for the `install_krakenuniq.sh` script. Alternatively, you can specify the Jellyfish path to `krakenuniq-build` with `krakenuniq-build --jellyfish-bin /usr/bin/jellyfish1`. By default, only `--jellyfish-bin`/`JELLYFISH_BIN`, the installed `krakenfish`, and `krakenfish` in the PATH are used.
 
 OSX by default links `g++` to `clang` without OpenMP support. When using clang, you may get the error `clang: fatal error: unsupported option '-fopenmp'`. To fix this, install `g++` with HomeBrew and use the `-c` option of `krakenuniq_install.sh` to specify the HomeBrew version of `g++`, which is accessible with `g++-8`: 
 ``` 

@@ -70,7 +70,7 @@ script_dir=`dirname $0`
 
 DATABASE_DIR="$KRAKEN_DB_NAME"
 FIND_OPTS=-L
-[[ "$JELLYFISH_BIN" == "" ]] && JELLYFISH_BIN="$script_dir/jellyfish-install/bin/jellyfish"
+[[ "$JELLYFISH_BIN" == "" ]] && JELLYFISH_BIN="$script_dir/krakenfish"
 NCBI_SERVER="ftp.ncbi.nih.gov"
 FTP_SERVER="ftp://$NCBI_SERVER"
 
@@ -153,7 +153,7 @@ else
   else
     echo "You are likely using Jellyfish version 2 in $JELLYFISH_BIN"
     $JELLYFISH_BIN --version
-    echo "KrakenUniq requires Jellyfish version 1 for building the database, please install KrakenUniq version 0.7.3 or higher to install the proper version of Jellyfish automatically or use option --jellyfish-bin </path_to/jellyfish> where jellyfish is jellyfish is version 1 binary"
+    echo "KrakenUniq requires Jellyfish version 1 for building the database, please install KrakenUniq version 0.7.3 or higher to install the proper version of Jellyfish automatically or use option --jellyfish-bin </path_to/krakenfish> where krakenfish is a Jellyfish version 1 binary"
     exit 1
   fi
   echo "K-mer set created. [$(report_time_elapsed $start_time1)]"

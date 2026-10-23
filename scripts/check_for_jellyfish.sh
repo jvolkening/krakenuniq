@@ -25,9 +25,9 @@ set -u  # Protect against uninitialized vars.
 set -e  # Stop on error
 set -o pipefail  # Stop on failures in non-final pipeline commands
 
-JELLYFISH_BIN=${JELLFISH_BIN:-}
+JELLYFISH_BIN=${JELLYFISH_BIN:-}
 JELLYFISH1_BIN=""
-for JF in $JELLYFISH_BIN $(dirname $0)/jellyfish/bin/jellyfish  /usr/local/opt/jellyfish-1.1/bin/jellyfish jellyfish1 jellyfish; do
+for JF in $JELLYFISH_BIN "$(dirname $0)/krakenfish" krakenfish; do
   if test -f $JF || command -v $JF >/dev/null 2>&1; then
     JELLYFISH1_BIN=$JF;
     break
@@ -35,7 +35,7 @@ for JF in $JELLYFISH_BIN $(dirname $0)/jellyfish/bin/jellyfish  /usr/local/opt/j
 done
 
 if [ "$JELLYFISH1_BIN" == "" ]; then
-    echo "Did not find jellyfish!" 1>&2
+    echo "Did not find krakenfish (Jellyfish v1)!" 1>&2
     exit 1
 fi
 
