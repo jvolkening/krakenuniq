@@ -5,7 +5,6 @@ AM_INIT_AUTOMAKE([subdir-objects foreign parallel-tests color-tests])
 AM_SILENT_RULES([yes])
 AC_CONFIG_SRCDIR([jellyfish])
 AC_CONFIG_HEADERS([config.h])
-AC_CONFIG_MACRO_DIR([m4])
 AC_PROG_LIBTOOL
 
 # Change default compilation flags
@@ -26,9 +25,9 @@ AC_CONFIG_FILES([
 )
 
 AC_ARG_VAR([MD5], [Path to md5 hashing program])
-AS_IF([test "x$MD5" = "x"], AC_CHECK_PROG([MD5], [md5sum], [md5sum]), [])
-AS_IF([test "x$MD5" = "x"], AC_CHECK_PROG([MD5], [md5], [md5 -r]), [])
-AS_IF([test "x$MD5" = "x"], AC_MSG_ERROR([Could not find md5 hashing program in your path]), [])
+AS_IF([test "x$MD5" = "x"], [AC_CHECK_PROG([MD5], [md5sum], [md5sum])], [])
+AS_IF([test "x$MD5" = "x"], [AC_CHECK_PROG([MD5], [md5], [md5 -r])], [])
+AS_IF([test "x$MD5" = "x"], [AC_MSG_ERROR([Could not find md5 hashing program in your path])], [])
 
 AC_ARG_WITH([sse],
             [AS_HELP_STRING([--with-sse], [enable SSE])],
