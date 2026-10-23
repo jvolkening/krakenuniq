@@ -15,7 +15,7 @@ use Fcntl;
 use IO::Handle;
 use IPC::Cmd qw/can_run/;
 use IPC::Run qw/run timeout/;
-use List::Util qw/sum/;
+use List::Util qw/max/;
 use POSIX qw/ceil/;
 
 our $NAME = 'ku_build';
@@ -31,7 +31,7 @@ my $count_kmers = 0;
 my $sort_kmers = 0;
 my $set_lcas = 0;
 my $work_in_memory = 0;
-my $non_overlapping = 0;
+my $step = 1;
 my $fn_compress;
 my $kmer_len = 31;
 my $minimizer_len = 15;
@@ -49,7 +49,7 @@ GetOptions(
     'validate' => \$validate,
     'max_size=s' => \$max_size_gb,
     'work_in_memory' => \$work_in_memory,
-    'non_overlapping' => \$non_overlapping,
+    'step=i' => \$step,
     'compress_to=s' => \$fn_compress,
     'k=i' => \$kmer_len,
     'minimizer=i' => \$minimizer_len,
@@ -82,7 +82,6 @@ my $KRAKEN_DIR = locate_install();
 my $JELLYFISH_BIN = locate_jellyfish();
 my $HASH_SIZE = calc_hash_size();
 my $THREADS = calc_threads();
-
 
 my $KMERS_SHRUNK = sprintf( "%s/%s", $dir_out, 'shrunk.jdb' );
 my $KMERS_SORTED = sprintf( "%s/%s", $dir_out, 'sorted.kdb' );
@@ -386,6 +385,8 @@ sub count_kmers {
         '-C',
         '-t' => $THREADS,
         '-o' => "$tmp/jfdb_tmp",
+        '--presence-only',
+        '--step' => $step,,
         '/dev/stdin',
     );
     my ($ok, $err) = stream_inputs($fns, '|', \@cmd);
@@ -407,43 +408,25 @@ sub count_kmers {
             or die "Error moving single jellyfish file: $@";
     }
     else {
-        my @curr_fns;
-        my $curr_size = 0;
-        my $total_added = 0;
-        while (1) {
-            $curr_size = sum map {-s "$_"} @curr_fns;
-            my $added = 0;
-            while (scalar @parts
-                && $curr_size + (-s "$parts[0]") < free_disk_space("$tmp_merged")*0.95) {
-                push @curr_fns, shift @parts;
-                $curr_size += -s "$curr_fns[-1]";
-                ++$added;
-            }
-            if (! $added) {
-                die "Not enough remaining free space to complete merge!";
-            }
-            $total_added += $added;
-            my @cmd = (
-                $JELLYFISH_BIN,
-                'merge',
-                '-o' => "$tmp_merged",
-                @curr_fns,
-            );
-            my $stderr;
-            my $res = run \@cmd, '2>', \$stderr;
-            if (! $res) {
-                die "jellyfish merged failed:\n$stderr"
-            }
-            die "Missing merged jellyfish output"
-                if (! -r "$tmp_merged");
-            unlink $_ for (@curr_fns);
-            last if (! scalar @parts);
-            @curr_fns = ($tmp_merged);
-            $tmp_merged = File::Dir->new(DIR => $dir_big_scratch);
-            close $tmp_merged;
+        my $need = max( map {-s "$_"} @parts ) * 1.5;
+        my $have = free_disk_space("$tmp_merged");
+        if ($need > $have) {
+            die "Not enough disk space available to merge (need $need, have $have)!";
         }
-        die "Internal error: mismatch between found parts and processed parts"
-            if ($total_added != $n_parts);
+        my @cmd = (
+            $JELLYFISH_BIN,
+            'merge',
+            '-o' => "$tmp_merged",
+            '--free-inputs',
+            @parts,
+        );
+        my $stderr;
+        my $res = run \@cmd, '2>', \$stderr;
+        if (! $res) {
+            die "jellyfish merged failed:\n$stderr"
+        }
+        die "Missing merged jellyfish output"
+            if (! -r "$tmp_merged");
     }
 
     my $elapsed = time - $start;
