@@ -1,0 +1,28 @@
+Version 1.1
+===========
+
+* Read input from pipes. For example, to count DNA from zipped files, run:
+
+% gunzip -c *.fa.gz | jellyfish [options] /dev/fd/0
+
+* Support fasta and fastq formats.
+
+* count --step N: only count every N-th k-mer window of each run of
+  valid bases (default 1: every window). The phase is preserved across
+  parser buffer boundaries. Counts differ from full sliding-window
+  counts. Not supported with --quake.
+
+* count --presence-only: only record the presence of k-mers (1 bit
+  counter in memory, k-mers already seen are not incremented).
+  --out-counter-len still sets the width of the counter field in the
+  output.
+
+* merge --free-inputs: release the disk space of the input files as
+  they are consumed and delete them on success, so merging needs
+  little more than the size of the final database (Linux only; the
+  inputs are unusable if merge fails).
+
+* Support for counting 'q-mers', as defined by the Quake error
+  correcting software (http://www.cbcb.umd.edu/software/quake/).
+
+* New dump subcommands which replaces 'stats -f' and 'stats -c'.
