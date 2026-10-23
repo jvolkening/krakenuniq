@@ -35,7 +35,7 @@ for JF in $JELLYFISH_BIN "$(dirname $0)/krakenfish" krakenfish; do
 done
 
 if [ "$JELLYFISH1_BIN" == "" ]; then
-    echo "Did not find krakenfish (Jellyfish v1)!" 1>&2
+    echo "Did not find krakenfish or any other Jellyfish v1!" 1>&2
     exit 1
 fi
 
