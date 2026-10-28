@@ -7,8 +7,9 @@ use autodie;
 
 use Cwd qw/abs_path/;
 use Getopt::Long;
-use File::Basename qw/dirname/;
+use File::Basename qw/basename dirname/;
 use File::Copy qw/copy move/;
+use File::Path qw/make_path/;
 use File::Temp;
 use FindBin;
 use Fcntl;
@@ -88,6 +89,13 @@ my $KMERS_SORTED = sprintf( "%s/%s", $dir_out, 'sorted.kdb' );
 my $INDEX = sprintf( "%s/%s", $dir_out, 'database.idx' );
 my $LCAS = sprintf( "%s/%s", $dir_out, 'database.kdb' );
 my $COUNTS = sprintf( "%s/%s", $dir_out, 'database.kdb.counts' );
+
+if (-e $dir_out && ! -d $dir_out) {
+    die "File exists at output path given but is not directory!\n";
+}
+elsif (! -e $dir_out) {
+    make_path($dir_out);
+}
 
 my %regex = (
     FASTA => '.*\/.*\.(fasta|fa|fas|fsa|fna)(\.gz)?$',
@@ -171,11 +179,12 @@ sub compress_db {
         'tar',
         '-I' => "zstd -19 -T$THREADS",
         '-cf' => "$tmp",
-        $LCAS,
-        $COUNTS,
-        $INDEX,
+        '-C' => dirname($LCAS),
+        basename($LCAS),
+        basename($COUNTS),
+        basename($INDEX),
     );
- 
+
     my $res = run \@cmd, '2>', \$stderr;
     die "compression failed:\n$stderr"
         if (! $res);
