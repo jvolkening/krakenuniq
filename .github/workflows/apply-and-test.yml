@@ -30,3 +30,4 @@ jobs:
           git add src scripts README.md tests
           git commit -m "Allow --preload-size (classify -x) with multiple databases" -m "The chunks of all databases share one buffer, so memory use stays at the given size. Earlier databases keep precedence when merging, giving output identical to the non-chunked path." -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
           git push
+# run 4
