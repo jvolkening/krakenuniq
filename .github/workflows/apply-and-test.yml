@@ -19,6 +19,8 @@ jobs:
           chmod +x install_krakenuniq.sh tests/preload_size_multi_db.sh
           ./install_krakenuniq.sh "$HOME/ku"
       - name: Test
+        env:
+          JELLYFISH_BIN: /home/runner/ku/krakenfish
         run: tests/preload_size_multi_db.sh "$HOME/ku"
       - name: Commit result
         run: |
