@@ -17,10 +17,11 @@ use IO::Handle;
 use IPC::Cmd qw/can_run/;
 use IPC::Run qw/run timeout/;
 use List::Util qw/max/;
+use Pod::Usage;
 use POSIX qw/ceil/;
 
-our $NAME = 'ku_build';
-our $VERSION = 0.002;
+use constant PROGRAM => 'ku_build';
+our $VERSION = 0.003;
 
 my $dir_data;
 my $dir_out;
@@ -48,13 +49,15 @@ GetOptions(
     'sort' => \$sort_kmers,
     'set_lcas' => \$set_lcas,
     'validate' => \$validate,
-    'max_size=s' => \$max_size_gb,
+    'max_size=i' => \$max_size_gb,
     'work_in_memory' => \$work_in_memory,
     'step=i' => \$step,
     'compress_to=s' => \$fn_compress,
     'k=i' => \$kmer_len,
     'minimizer=i' => \$minimizer_len,
-);
+    'help'                => sub{ pod2usage(-verbose => 2, -exitval => 0); },
+    'version'             => sub{ say 'This is ', PROGRAM,' v', $VERSION; exit },
+) or pod2usage( -verbose  => 1);
 
 # if no specific step was requested, do everything
 my $do_all = 
@@ -712,3 +715,184 @@ sub validate {
     return;
 
 }
+
+__END__
+
+=head1 NAME
+
+ku_build - an alternative build script for KrakenUniq databases
+
+=head1 SYNOPSIS
+
+    ku_build \
+        --data <path_to_FASTA_and_MAP_directory> \
+        --out <path_to_output_database_directory> \
+        --k <kmer_length> \
+        --max_size <size_in_GB> \
+        --taxdb <path_to_taxDB_file> \
+        --validate \
+        --compress_to <path_to_tar.zst_of_database> \
+        --tmp_fast <path_to_SSD_tmp_space> \
+        --tmp_big <path_to_large_tmp_space>
+
+=head1 DESCRIPTION
+
+C<ku_build> is an alternative to C<krakenuniq-build> that removes some
+features (such as data and taxonomy downloads) and focuses on providing a
+robust, configurable, and flexible build process on limited hardware. It
+auto-calculates parameters (such as jellyfish hash size) where possible and
+does additional checks of available memory and disk space before beginning
+each stage of the build process. It also modifies some default values of each
+build step in order to minimize the necessary disk space and succeed with the
+available RAM on the system.
+
+=head1 PREREQUISITES
+
+All preqrequisites are installed alongside C<ku_build> as part of the
+C<krakneuniq> distribution. The script itself uses only core Perl modules.
+
+=head1 OPTIONS
+
+=head2 Input
+
+=over 4
+
+=item B<--data> I<directory_path>
+
+(required) Path to a directory containing FASTA genome sequences and accompanying
+taxonomic map files. See L<Input Data> below for a description of the expected
+format and arrangement. No default.
+
+=item B<--taxDB> I<file_path>
+
+(reqiured) Path to the taxDB file to be used for the database build. See
+L<Input Data> below for a discussion of how to generate this file.
+No default.
+
+=back
+
+=head2 Output 
+
+=over 4
+
+=item B<--out> I<directory_path>
+
+(reqiured) Path to the directory where the final database files will be written.
+No default.
+
+=item B<--compress_to> I<file_path>
+
+(optional) Location to save a ZSTD-compressed tarball of the final database.
+See L<Output Files> below for a further discussion. No default.
+
+=back
+
+=head2 Configuration 
+
+=over 4
+
+=item B<--k> I<integer>
+
+K-mer length to use for the database. Default: 31
+
+=item B<--minimizer> I<integer>
+
+Minimizer length to use (default: 15)
+
+=item B<--max_size> I<integer>
+
+Maximum final database size, in GiB. Kmers will be randomly downsampled to fit
+into this limit. Default: none
+
+=item B<--step> I<integer>
+
+Increasing this value will cause jellyfish to only record every C<step-size>
+kmers, instead of every unique kmer. This is an alternative approach to
+C<--max_size> to downsample the database; C<max_size> should be preferred, but
+this parameter will downsample prior to writing the initial k-mer database and
+can allow a database to be built where the full k-mer count file wouldn't
+otherwise fit in available disk space. Default: 1
+
+=item B<--work_in_memory>
+
+By default, some underlying steps will work on disk if not enough memory is
+available to load the entire database. Setting this flag will force those
+programs to only work in memory; they will throw OOM errors if the system
+doesn't have sufficient memory for this. Generally, you'll want to leave this
+unset and let the underlying tools make these decisions. Default: off
+
+=item B<--tmp_fast> I<directory_path>
+
+At minimum, either this parameter or C<--tmp_big> must be set to a temporary
+directory on disk. This directory will be used for disk I/O-heavy steps if it
+has enough free space. Typically this will be a NVMe drive or at least a SATA
+SSD. Defaults to C<--tmp_big> if not set.
+
+=item B<--tmp_big> I<directory_path>
+
+At minimum, either this parameter or C<--tmp_fast> must be set to a temporary
+directory on disk. This directory will be used when insufficient space is
+available in C<--tmp_fast>. It should be set to the largest available
+temporary directory you have. Defaults to C<--tmp_fast> if not set.
+
+Print usage description and exit
+
+=back
+
+=head2 Workflow
+
+By default, the entire database building workflow will run except for
+validation. The following options can be used to adjust which step the
+workflow will run through.
+
+=over 4
+
+=item B<--count>
+
+Perform k-mer counting (and shrinking if necessary) and stop.
+
+=item B<--sort>
+
+Perform database build through the C<sort> step and stop.
+
+=item B<--set_lcas>
+
+Perform database build through the C<set_lcas> step and stop.
+
+=item B<--validate>
+
+Perform the same database validation as the original C<krakenuniq-build>
+script by classifying all input sequences against the final database. This is
+generally a good idea to validate your database performance, but it can be
+quite slow for large databases and so is not performed by default. Default:
+off
+
+=back
+
+=head1 CAVEATS AND BUGS
+
+Please submit bug reports to the issue tracker in the distribution repository.
+
+=head1 AUTHOR
+
+Jeremy Volkening (jeremy.volkening@base2bio.com)
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright 2026 Jeremy Volkening
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
+
