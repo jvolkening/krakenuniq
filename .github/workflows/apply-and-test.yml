@@ -1,0 +1,30 @@
+name: apply-and-test
+on:
+  push:
+    branches: [preload-size-multi-db]
+    paths: ['.github/workflows/apply-and-test.yml']
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libbz2-dev autoconf automake libtool
+      - name: Apply changes
+        run: python3 .github/patch_preload.py
+      - name: Build and install
+        run: |
+          chmod +x install_krakenuniq tests/preload_size_multi_db.sh
+          ./install_krakenuniq "$HOME/ku"
+      - name: Test
+        run: tests/preload_size_multi_db.sh "$HOME/ku"
+      - name: Commit result
+        run: |
+          git rm -q .github/patch_preload.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src scripts README.md tests
+          git commit -m "Allow --preload-size (classify -x) with multiple databases" -m "The chunks of all databases share one buffer, so memory use stays at the given size. Earlier databases keep precedence when merging, giving output identical to the non-chunked path." -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push
