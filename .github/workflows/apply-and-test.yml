@@ -16,8 +16,8 @@ jobs:
         run: python3 .github/patch_preload.py
       - name: Build and install
         run: |
-          chmod +x install_krakenuniq tests/preload_size_multi_db.sh
-          ./install_krakenuniq "$HOME/ku"
+          chmod +x install_krakenuniq.sh tests/preload_size_multi_db.sh
+          ./install_krakenuniq.sh "$HOME/ku"
       - name: Test
         run: tests/preload_size_multi_db.sh "$HOME/ku"
       - name: Commit result
