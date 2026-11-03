@@ -114,7 +114,9 @@ namespace kraken {
 
     uint32_t chunks() const;
     void load_chunk(const uint32_t db_chunk_id);
-    void prepare_chunking(const uint64_t max_bytes_for_db);
+    // If shared_buffer is given (at least max_bytes_for_db bytes, owned by the caller),
+    // it is used instead of allocating a private buffer.
+    void prepare_chunking(const uint64_t max_bytes_for_db, char *shared_buffer = NULL);
     bool is_minimizer_in_chunk(const uint64_t minimizer, const uint32_t db_chunk_id) const;
 
     private:
@@ -135,6 +137,7 @@ namespace kraken {
     std::vector<uint64_t> dbx_chunk_bounds;
 
     char *data;
+    bool owns_data;
     uint64_t data_size;
     uint64_t data_offset;
   };
