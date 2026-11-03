@@ -93,7 +93,7 @@ for size in 600K 800K 2M 100M; do
 done
 
 # a buffer too small for even a single minimizer bin must fail with an error message
-run tiny --preload-size 1K
+run tiny --preload-size 8
 if grep -q 'too small' tiny.log; then
   echo "OK: too small --preload-size is rejected"
 else

@@ -56,6 +56,7 @@ KrakenDB::KrakenDB() {
   _filesize = 0;
   _chunks = 0;
   data = NULL;
+  owns_data = false;
   data_size = 0;
   data_offset = 0;
 }
@@ -67,6 +68,7 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
   fptr = ptr;
   _chunks = 0;
   data = NULL;
+  owns_data = false;
   data_size = 0;
   data_offset = 0;
   if (ptr == NULL) {
@@ -87,7 +89,7 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
 
 // destructor
 KrakenDB::~KrakenDB() {
-  if (data != NULL && data_size > 0)
+  if (owns_data && data != NULL && data_size > 0)
     munmap(data, data_size);
 }
 
@@ -469,15 +471,21 @@ uint64_t KrakenDB::upper_bound(uint64_t first, const uint64_t last)
   return first;
 }
 
-void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db) {
-  data = (char*) mmap(0, max_bytes_for_db, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (data == (void *) -1)
-  {
-    printf("ERROR: Could not allocated memory for loading database chunks (error code %i: %s)\n", errno, strerror(errno));
-    exit(-1);
+void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db, char *shared_buffer) {
+  if (shared_buffer != NULL) {
+    data = shared_buffer;
+    owns_data = false;
+  } else {
+    data = (char*) mmap(0, max_bytes_for_db, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == (void *) -1)
+    {
+      printf("ERROR: Could not allocated memory for loading database chunks (error code %i: %s)\n", errno, strerror(errno));
+      exit(-1);
+    }
+    owns_data = true;
+    mlock(data, max_bytes_for_db);
   }
   data_size = max_bytes_for_db;
-  mlock(data, data_size);
 
   this->_chunks = 0;
 
@@ -492,7 +500,12 @@ void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db) {
   {
     // upper_bound returns element idx_pos that is the first that "is greater" (i.e., that does not fit into "data")
     // in other terms, idx_pos closes our half-open interval (excl. upper bound), hence we don't need to decrement it
+    const uint64_t prev_idx_pos = idx_pos;
     idx_pos = upper_bound(idx_pos, max_idx_pos);
+    if (idx_pos == prev_idx_pos) {
+      fprintf(stderr, "ERROR: The preload size (%llu bytes) is too small to hold a single minimizer bin of the database.\n", (unsigned long long) max_bytes_for_db);
+      exit(1);
+    }
     // get starting position for next larger minimizer (that does not fit into "data")
     // in other terms, dbx_pos closes our half-open interval (excl. upper bound), hence we don't need to decrement it
     dbx_pos = index_ptr->mmap_at(idx_pos);

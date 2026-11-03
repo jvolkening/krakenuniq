@@ -176,6 +176,20 @@ int main(int argc, char **argv) {
   static vector<QuickFile> db_files (DB_filenames.size());
   static vector<KrakenDBIndex> db_indices (DB_filenames.size());
 
+  // A single buffer shared by all databases (they are processed one after the other),
+  // so that the memory used for chunks never exceeds Populate_memory_size
+  char *chunk_buffer = NULL;
+  if (Populate_memory && Populate_memory_size > 0)
+  {
+    chunk_buffer = (char*) mmap(0, Populate_memory_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (chunk_buffer == (void *) -1)
+    {
+      cerr << "ERROR: Could not allocate " << Populate_memory_size << " bytes for loading database chunks: " << strerror(errno) << endl;
+      return 1;
+    }
+    mlock(chunk_buffer, Populate_memory_size);
+  }
+
 
   // TODO: Check DB_filenames and Index_filesnames have the same length
   for (size_t i=0; i < DB_filenames.size(); ++i) {
@@ -195,7 +209,7 @@ int main(int argc, char **argv) {
     }
     else if (Populate_memory && Populate_memory_size > 0)
     {
-      KrakenDatabases[i]->prepare_chunking(Populate_memory_size);
+      KrakenDatabases[i]->prepare_chunking(Populate_memory_size, chunk_buffer);
     }
   }
 
@@ -387,7 +401,8 @@ bool determine_input_file_type(char* filename)
   return ret;
 };
 
-void merge_intermediate_results_by_workers(const bool first_intermediate_output, const std::string & tmp_file_name) {
+// same_db_as_prev: the previous intermediate result came from another chunk of the same database
+void merge_intermediate_results_by_workers(const bool first_intermediate_output, const bool same_db_as_prev, const std::string & tmp_file_name) {
   const std::string filename_merged_summary = tmp_file_name;
 
   FILE *fp_prev_merged_summary = NULL;
@@ -444,10 +459,11 @@ void merge_intermediate_results_by_workers(const bool first_intermediate_output,
 
       for (uint32_t i = 0; i < taxa_prev_summary.size(); ++i)
       {
-        assert(!(taxa[i] && taxa_prev_summary[i])); // a kmer cannot be found in more than one database chunk
+        // a kmer cannot be found in more than one chunk of the same database (but may be in several databases)
+        assert(!same_db_as_prev || !(taxa[i] && taxa_prev_summary[i]));
         if (taxa_prev_summary[i])
         {
-          taxa[i] = taxa_prev_summary[i]; // if previous chunk/database got a match, keep the tax info
+          taxa[i] = taxa_prev_summary[i]; // if previous chunk/database got a match, keep the tax info (earlier databases take precedence)
         }
       }
     }
@@ -584,7 +600,7 @@ void process_file_with_db_chunk(char *filename) {
   bool first_intermediate_output = true;
   for (size_t i=0; i<KrakenDatabases.size(); ++i)
   {
-    for (uint32_t db_chunk_id = 0; db_chunk_id < KrakenDatabases[0]->chunks(); ++db_chunk_id)
+    for (uint32_t db_chunk_id = 0; db_chunk_id < KrakenDatabases[i]->chunks(); ++db_chunk_id)
     {
       total_sequences = 0;
       total_bases = 0;
@@ -629,7 +645,7 @@ void process_file_with_db_chunk(char *filename) {
             break;
 
           for (size_t j = 0; j < work_unit.size(); j++) {
-            classify_sequence_with_db_chunk(work_unit[j], fp, db_chunk_id, 0);
+            classify_sequence_with_db_chunk(work_unit[j], fp, db_chunk_id, i);
           }
 
 #ifdef _OPENMP
@@ -648,7 +664,7 @@ void process_file_with_db_chunk(char *filename) {
       }  // end parallel section
 
       delete reader;
-      merge_intermediate_results_by_workers(first_intermediate_output, tmp_file_name);
+      merge_intermediate_results_by_workers(first_intermediate_output, db_chunk_id > 0, tmp_file_name);
       first_intermediate_output = false;
     }
   }

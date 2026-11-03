@@ -50,7 +50,7 @@ By default, KrakenUniq performs memory mapping to load the database; i.e., it do
 
 To improve the performance when not enough main memory is available to load the entire database into RAM, we added a new capability to KrakenUniq. When using this new feature, only a chunk of the database is loaded into memory at a time, after which the algorithm iterates over the reads and looks up all k-mers in those reads that are matching in this database chunk. This process is repeated until the entire database has been processed. The k-mer lookups are then merged, and reads are classified based on the results of the full database. This new feature makes it feasible to run KrakenUniq on very large datasets and huge databases on virtually any computer, even a laptop, while providing exact classifications that are identical to those of KrakenUniq in its other modes. Users can employ this feature with --preload-size and specify the amount of available main memory that they want to use for loading chunks of the database, e.g., --preload-size 8G or --preload-size 500M.
 
-IMPORTANT!  The --preload-size option can only be used with a single input database.
+With several input databases (hierarchical classification), the chunks of all databases are loaded one after the other into the same buffer, so the amount given to --preload-size is the total memory used for the databases. The results are identical to those without --preload-size. The amount must be large enough to hold the largest single chunk (one minimizer bin plus its index entries) of any database; otherwise an error is reported.
 
 This release also includes an improvement for automatic detection of input format.
 The input format (fastq or fasta, bzip2 or gzip compressed) is now detected automatically. No need to use --fasta-input, --fastq-input, --gzip-compressed or --bzip2-compressed switches.
@@ -123,7 +123,7 @@ Options:
   --only-classified-output
                           Print no Kraken output for unclassified sequences
   --preload               Loads the entire DB into memory before classification
-  --preload-size SIZE     Loads DB into memory in chunks of SIZE, e.g. 500M or 7G (if RAM is small), overrides --preload flag
+  --preload-size SIZE     Loads DB into memory in chunks of SIZE, e.g. 500M or 7G (if RAM is small), overrides --preload flag. With multiple databases, SIZE is the total memory used for all of them
   --paired                The two filenames provided are paired-end reads
   --check-names           Ensure each pair of reads have names that agree
                           with each other; ignored if --paired is not specified
