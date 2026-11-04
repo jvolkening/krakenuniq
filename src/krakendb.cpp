@@ -40,9 +40,7 @@ static const char * KRAKEN_INDEX_STRING = "KRAKIDX";
 // Next byte determines # of indexed nt
 static const char * KRAKEN_INDEX2_STRING = "KRAKIX2";
 
-// XOR mask for minimizer bin keys (allows for better distribution)
-// scrambles minimizer sort order
-static const uint64_t INDEX2_XOR_MASK = 0xe37e28c4271b5a2dULL;
+// (INDEX2_XOR_MASK, the XOR mask for minimizer bin keys, is in compactdb.hpp)
 
 // Basic constructor
 KrakenDB::KrakenDB() {
@@ -58,6 +56,13 @@ KrakenDB::KrakenDB() {
   data = NULL;
   data_size = 0;
   data_offset = 0;
+  compact = false;
+  rec_bits = 0;
+  dict_bits = 0;
+  dict_size = 0;
+  dict = NULL;
+  cdata = NULL;
+  cdata_bytes = 0;
 }
 
 // Assumes ptr points to start of a readable mmap'ed file
@@ -69,8 +74,58 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
   data = NULL;
   data_size = 0;
   data_offset = 0;
+  compact = false;
+  rec_bits = 0;
+  dict_bits = 0;
+  dict_size = 0;
+  dict = NULL;
+  cdata = NULL;
+  cdata_bytes = 0;
   if (ptr == NULL) {
     errx(EX_DATAERR, "pointer is NULL");
+  }
+  if (!strncmp(ptr, COMPACT_DB_MAGIC, strlen(COMPACT_DB_MAGIC))) {
+    uint64_t hdr[11];
+    memcpy(hdr, ptr, sizeof(hdr));
+    compact = true;
+    k = hdr[1];
+    uint64_t nt = hdr[2];
+    key_ct = hdr[3];
+    dict_size = hdr[4];
+    dict_bits = hdr[5];
+    uint64_t pos_bits = hdr[6];
+    rec_bits = hdr[7];
+    uint64_t max_taxid_bits = hdr[8];
+    cdata_bytes = hdr[9];
+    if (k < 1 || k > 31 || nt < 1 || nt > k)
+      errx(EX_DATAERR, "compact database has invalid k (%llu) or minimizer length (%llu)",
+           (unsigned long long) k, (unsigned long long) nt);
+    if (max_taxid_bits > COMPACT_MAX_TAXID_BITS)
+      errx(EX_DATAERR, "compact database allows %llu-bit taxids, reader supports at most %u",
+           (unsigned long long) max_taxid_bits, COMPACT_MAX_TAXID_BITS);
+    key_bits = 2 * k;
+    val_len = 4;
+    key_len = key_bits / 8 + !! (key_bits % 8);
+    codec.init(k, nt, INDEX2_XOR_MASK);
+    if (codec.pos_bits != pos_bits || codec.t_bits + dict_bits != rec_bits || codec.t_bits > 64
+        || dict_bits > 32 || dict_size == 0)
+      errx(EX_DATAERR, "compact database header is inconsistent");
+    uint64_t dict_bytes = (dict_size * 4 + 7) & ~7ull;
+    if (filesize != 0 && COMPACT_DB_HEADER_BYTES + dict_bytes + cdata_bytes + COMPACT_PAD_BYTES > filesize)
+      errx(EX_DATAERR, "compact database is truncated");
+    if (cdata_bytes != (key_ct * rec_bits + 7) / 8)
+      errx(EX_DATAERR, "compact database size does not match its key count");
+    dict = (const uint32_t *) (ptr + COMPACT_DB_HEADER_BYTES);
+    cdata = ptr + COMPACT_DB_HEADER_BYTES + dict_bytes;
+    for (uint64_t i = 0; i < dict_size; i++) {
+      if (dict[i] >> max_taxid_bits)
+        errx(EX_DATAERR, "compact database contains taxid %u which needs more than %llu bits",
+             dict[i], (unsigned long long) max_taxid_bits);
+    }
+    std::cerr << "Parsed compact database header with " << key_ct << " keys with k of " << (size_t)k
+              << " [minimizer length " << nt << ", " << dict_size << " distinct taxids, "
+              << rec_bits << " bits per key]." << std::endl;
+    return;
   }
   if (strncmp(ptr, DATABASE_FILE_TYPE, strlen(DATABASE_FILE_TYPE))) {
     errx(EX_DATAERR,"database in improper format - found %s", string(ptr, strlen(DATABASE_FILE_TYPE)).c_str());
@@ -97,6 +152,8 @@ size_t KrakenDB::filesize() const {
 
 //using std::map to have the keys sorted
 std::map<uint32_t,uint64_t> KrakenDB::count_taxons() {
+  if (compact)
+    return count_taxons_compact();
   char *ptr = get_pair_ptr();
   size_t pair_sz = pair_size();
 
@@ -121,6 +178,24 @@ std::map<uint32_t,uint64_t> KrakenDB::count_taxons() {
   return taxon_counts;
 }
 
+
+std::map<uint32_t,uint64_t> KrakenDB::count_taxons_compact() {
+  std::vector<uint64_t> counts(dict_size, 0);
+  for (uint64_t i = 0; i < key_ct; i++) {
+    if (i % 10000000 == 1)
+      fprintf(stderr, "\r %.2f %%", 100*(double)i/(double)key_ct );
+    uint64_t di = compact_read_bits(cdata, i * rec_bits + codec.t_bits, dict_bits);
+    if (di >= dict_size)
+      errx(EX_DATAERR, "compact database is corrupt (taxid index out of range)");
+    counts[di]++;
+  }
+  fprintf(stderr, "\r");
+  std::map<uint32_t, uint64_t> taxon_counts;
+  for (uint64_t i = 0; i < dict_size; i++)
+    if (counts[i])
+      taxon_counts[dict[i]] = counts[i];
+  return taxon_counts;
+}
 
 // Creates an index, indicating starting positions of each bin
 // Bins contain k-mer/taxon pairs with k-mers that share a bin key
@@ -173,6 +248,12 @@ KrakenDBIndex *KrakenDB::get_index() {
 
 // Associates the index with this database
 void KrakenDB::set_index(KrakenDBIndex *i_ptr) {
+  if (i_ptr != NULL && compact != i_ptr->is_compact())
+    errx(EX_DATAERR, "compact databases need compact indexes (and vice versa)");
+  if (i_ptr != NULL && compact && i_ptr->indexed_nt() != codec.nt)
+    errx(EX_DATAERR, "index minimizer length does not match compact database");
+  if (i_ptr != NULL && compact && i_ptr->ef_max != key_ct)
+    errx(EX_DATAERR, "compact index does not match compact database (key count differs)");
   index_ptr = i_ptr;
 }
 
@@ -260,6 +341,8 @@ uint32_t *KrakenDB::kmer_query(uint64_t kmer, uint64_t *last_bin_key,
                                int64_t *min_pos, int64_t *max_pos,
                                bool retry_on_failure)
 {
+  if (compact)
+    return compact_query(kmer, last_bin_key, min_pos, max_pos, retry_on_failure, false);
   int64_t min, max, mid;
   uint64_t comp_kmer;
   uint64_t b_key;
@@ -329,6 +412,59 @@ uint32_t *KrakenDB::kmer_query(uint64_t kmer, uint64_t *last_bin_key,
   return answer;
 }
 
+// Lookup in a compact database. The record key is t (see CompactKmerCodec),
+// which is derived from the query k-mer; the bin's records are sorted by t.
+uint32_t *KrakenDB::compact_query(uint64_t kmer, uint64_t *last_bin_key,
+                                  int64_t *min_pos, int64_t *max_pos,
+                                  bool retry_on_failure, bool use_chunks)
+{
+  uint64_t b_key, t;
+  codec.encode(kmer, &b_key, &t);
+
+  int64_t min, max;
+  if (retry_on_failure && *last_bin_key == b_key && *min_pos <= *max_pos) {
+    min = *min_pos;
+    max = *max_pos;
+  }
+  else {
+    uint64_t start, end;
+    index_ptr->bin_range(b_key, &start, &end);
+    min = start;
+    max = (int64_t) end - 1;
+    if (retry_on_failure) {
+      *last_bin_key = b_key;
+      *min_pos = min;
+      *max_pos = max;
+    }
+  }
+
+  const char *base = use_chunks ? data : cdata;
+  const uint64_t bit_shift = use_chunks ? data_offset * 8 : 0;
+  const unsigned t_bits = codec.t_bits;
+  const uint64_t R = rec_bits;
+
+  while (min + 7 <= max) {
+    int64_t mid = min + (max - min) / 2;
+    uint64_t comp = compact_read_bits(base, mid * R - bit_shift, t_bits);
+    if (t > comp)
+      min = mid + 1;
+    else if (t < comp)
+      max = mid - 1;
+    else {
+      min = max = mid;
+      break;
+    }
+  }
+  for (int64_t mid = min; mid <= max; mid++) {
+    uint64_t pos = mid * R - bit_shift;
+    if (compact_read_bits(base, pos, t_bits) == t) {
+      uint64_t di = compact_read_bits(base, pos + t_bits, dict_bits);
+      return di < dict_size ? (uint32_t *) &dict[di] : NULL;
+    }
+  }
+  return NULL;
+}
+
 // Binary search w/in the k-mer's bin
 uint32_t *KrakenDB::kmer_query(uint64_t kmer) {
   return kmer_query(kmer, NULL, NULL, NULL, false);
@@ -340,6 +476,8 @@ uint32_t *KrakenDB::kmer_query_with_db_chunks(uint64_t kmer, uint64_t *last_bin_
                                int64_t *min_pos, int64_t *max_pos,
                                bool retry_on_failure)
 {
+  if (compact)
+    return compact_query(kmer, last_bin_key, min_pos, max_pos, retry_on_failure, true);
   int64_t min, max, mid;
   uint64_t comp_kmer;
   uint64_t b_key;
@@ -418,6 +556,15 @@ uint32_t KrakenDB::chunks() const {
 }
 
 void KrakenDB::load_chunk(const uint32_t db_chunk_id) {
+  if (compact) {
+    // Only the bit-packed records are chunked; the compact index stays mmap'ed
+    const uint64_t start_byte = (dbx_chunk_bounds[db_chunk_id] * rec_bits) >> 3;
+    const uint64_t end_byte = (dbx_chunk_bounds[db_chunk_id + 1] * rec_bits + 7) >> 3;
+    memcpy(data, cdata + start_byte, end_byte - start_byte);
+    memset(data + (end_byte - start_byte), 0, COMPACT_PAD_BYTES);
+    data_offset = start_byte;
+    return;
+  }
   char* db_chunk_start = get_pair_ptr() + dbx_chunk_bounds[db_chunk_id] * pair_size();
   data_offset = dbx_chunk_bounds[db_chunk_id] * pair_size();
   const size_t db_chunk_len = (dbx_chunk_bounds[db_chunk_id + 1] - dbx_chunk_bounds[db_chunk_id]) * pair_size();
@@ -469,6 +616,43 @@ uint64_t KrakenDB::upper_bound(uint64_t first, const uint64_t last)
   return first;
 }
 
+// Chunk boundaries are whole bins; a chunk holds the bytes covering its records
+void KrakenDB::prepare_chunking_compact(const uint64_t max_bytes_for_db) {
+  const uint64_t n_bins = 1ull << (2 * index_ptr->indexed_nt());
+  uint64_t idx_pos = 0;
+  idx_chunk_bounds.push_back(0);
+  dbx_chunk_bounds.push_back(0);
+  while (idx_pos < n_bins) {
+    const uint64_t rec_start = dbx_chunk_bounds.back();
+    const uint64_t start_byte = (rec_start * rec_bits) >> 3;
+    auto fits = [&](uint64_t bin_end) {
+      uint64_t end_byte = (index_ptr->ef_at(bin_end) * rec_bits + 7) >> 3;
+      return end_byte - start_byte + COMPACT_PAD_BYTES <= max_bytes_for_db;
+    };
+    // largest bin_end in [idx_pos, n_bins] such that bins [idx_pos, bin_end) fit
+    uint64_t lo = idx_pos, hi = n_bins;
+    while (lo < hi) {
+      uint64_t mid = lo + (hi - lo + 1) / 2;
+      if (fits(mid))
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    if (lo == idx_pos)
+      errx(EX_USAGE, "database chunk size too small for a single minimizer bin");
+    idx_pos = lo;
+    const uint64_t rec_end = index_ptr->ef_at(idx_pos);
+    // trailing bins without k-mers are folded into the next chunk
+    if (rec_end == rec_start)
+      continue;
+    idx_chunk_bounds.push_back(idx_pos);
+    dbx_chunk_bounds.push_back(rec_end);
+    this->_chunks++;
+  }
+  // the last chunk must cover all remaining (empty) bins
+  idx_chunk_bounds.back() = n_bins;
+}
+
 void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db) {
   data = (char*) mmap(0, max_bytes_for_db, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (data == (void *) -1)
@@ -480,6 +664,11 @@ void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db) {
   mlock(data, data_size);
 
   this->_chunks = 0;
+
+  if (compact) {
+    prepare_chunking_compact(max_bytes_for_db);
+    return;
+  }
 
   const uint64_t max_idx_pos = 1ull << (2 * index_ptr->indexed_nt()); // excl bound (half-open interval)
   // const uint64_t max_dbx_pos = index_ptr->mmap_at(max_idx_pos); // excl bound (half-open interval)
@@ -538,18 +727,93 @@ KrakenDBIndex::KrakenDBIndex() {
   fptr = NULL;
   idx_type = 1;
   nt = 0;
+  data = NULL;
+  data_offset = 0;
+  ef_n = ef_max = 0;
+  ef_l = 0;
+  ef_lower = NULL;
+  ef_upper = ef_samples = NULL;
 }
 
 KrakenDBIndex::KrakenDBIndex(char *ptr) {
   fptr = ptr;
   idx_type = 1;
+  data = NULL;
+  data_offset = 0;
+  ef_n = ef_max = 0;
+  ef_l = 0;
+  ef_lower = NULL;
+  ef_upper = ef_samples = NULL;
   if (strncmp(ptr, KRAKEN_INDEX_STRING, strlen(KRAKEN_INDEX_STRING))) {
     idx_type = 2;
-    if (strncmp(ptr, KRAKEN_INDEX2_STRING, strlen(KRAKEN_INDEX2_STRING)))
-      errx(EX_DATAERR, "illegal Kraken DB index format");
+    if (strncmp(ptr, KRAKEN_INDEX2_STRING, strlen(KRAKEN_INDEX2_STRING))) {
+      idx_type = 3;
+      if (strncmp(ptr, COMPACT_INDEX_MAGIC, strlen(COMPACT_INDEX_MAGIC)))
+        errx(EX_DATAERR, "illegal Kraken DB index format");
+    }
   }
   ptr += strlen(KRAKEN_INDEX_STRING);
   memcpy(&nt, ptr, 1);
+  if (idx_type == 3) {
+    uint64_t hdr[6];
+    memcpy(hdr, fptr + 8, sizeof(hdr));
+    ef_n = hdr[0];
+    ef_max = hdr[1];
+    ef_l = hdr[2];
+    uint64_t upper_bits = hdr[3];
+    uint64_t n_samples = hdr[4];
+    if (nt < 1 || nt > 15 || ef_n != (1ull << (2 * nt)) + 1 || ef_l > 56
+        || n_samples != (ef_n + (1ull << COMPACT_SELECT_SHIFT) - 1) >> COMPACT_SELECT_SHIFT)
+      errx(EX_DATAERR, "compact index header is inconsistent");
+    uint64_t lower_words = (ef_n * ef_l + 63) / 64 + 1;
+    uint64_t upper_words = (upper_bits + 63) / 64 + 1;
+    ef_lower = fptr + COMPACT_INDEX_HEADER_BYTES;
+    ef_upper = (const uint64_t *) (ef_lower + lower_words * 8);
+    ef_samples = ef_upper + upper_words;
+  }
+}
+
+// Position of the i-th set bit in the upper bit vector
+uint64_t KrakenDBIndex::ef_select(uint64_t i) const {
+  uint64_t s = ef_samples[i >> COMPACT_SELECT_SHIFT];
+  uint64_t rem = i & ((1ull << COMPACT_SELECT_SHIFT) - 1);
+  uint64_t w = s >> 6;
+  uint64_t word = ef_upper[w] & (~0ull << (s & 63));
+  for (;;) {
+    uint64_t c = __builtin_popcountll(word);
+    if (rem < c)
+      break;
+    rem -= c;
+    word = ef_upper[++w];
+  }
+  while (rem--)
+    word &= word - 1;
+  return w * 64 + __builtin_ctzll(word);
+}
+
+uint64_t KrakenDBIndex::ef_value(uint64_t i, uint64_t upper_pos) const {
+  return ((upper_pos - i) << ef_l) | compact_read_bits(ef_lower, i * ef_l, ef_l);
+}
+
+uint64_t KrakenDBIndex::ef_at(uint64_t i) const {
+  return ef_value(i, ef_select(i));
+}
+
+// Records [start, end) belong to the bin
+void KrakenDBIndex::bin_range(uint64_t bin, uint64_t *start, uint64_t *end) {
+  if (idx_type != 3) {
+    *start = at(bin);
+    *end = at(bin + 1);
+    return;
+  }
+  uint64_t pos = ef_select(bin);
+  *start = ef_value(bin, pos);
+  // next set bit after pos
+  uint64_t w = pos >> 6;
+  uint64_t word = ef_upper[w] & ~((2ull << (pos & 63)) - 1);
+  while (word == 0)
+    word = ef_upper[++w];
+  *end = ef_value(bin + 1, w * 64 + __builtin_ctzll(word));
 }
 
 // Index version (v2 uses different minimizer sort order)
@@ -564,6 +828,8 @@ uint8_t KrakenDBIndex::indexed_nt() {
 
 // Convenience method, allows for testing guard
 uint64_t KrakenDBIndex::mmap_at(uint64_t idx) {
+  if (idx_type == 3)
+    return ef_at(idx);
   uint64_t *array = (uint64_t*) (fptr + strlen(KRAKEN_INDEX_STRING) + 1);
   #ifdef TESTING
   if (idx > 1 + (1ull << (nt * 2)))
@@ -578,6 +844,8 @@ uint64_t *KrakenDBIndex::get_array_with_db_chunks() { // TODO: remove wrapper
 }
 
 uint64_t KrakenDBIndex::at_with_db_chunks(uint64_t idx) {
+  if (idx_type == 3)
+    return ef_at(idx);
   uint64_t *array = get_array_with_db_chunks();
 #ifdef TESTING
   if ((idx - (data_offset / 8)) > 1 + (1ull << (nt * 2)))
@@ -593,6 +861,8 @@ uint64_t *KrakenDBIndex::get_array() {
 
 // Convenience method, allows for testing guard
 uint64_t KrakenDBIndex::at(uint64_t idx) {
+  if (idx_type == 3)
+    return ef_at(idx);
   uint64_t *array = get_array();
   #ifdef TESTING
   if (idx > 1 + (1ull << (nt * 2)))

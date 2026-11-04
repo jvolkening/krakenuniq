@@ -21,6 +21,7 @@
 #define KRAKENDB_HPP
 
 #include "kraken_headers.hpp"
+#include "compactdb.hpp"
 #include <unordered_map>
 #include <map>
 
@@ -41,6 +42,10 @@ namespace kraken {
     uint64_t *get_array();
     uint64_t at(uint64_t idx);
 
+    // Compact (Elias-Fano) indexes only: start/end record of a bin
+    bool is_compact() const { return idx_type == 3; }
+    void bin_range(uint64_t bin, uint64_t *start, uint64_t *end);
+
     friend KrakenDB;
 
     private:
@@ -50,6 +55,17 @@ namespace kraken {
 
     char *data;
     uint64_t data_offset;
+
+    // Compact index state
+    uint64_t ef_n;
+    uint64_t ef_max;
+    unsigned ef_l;
+    const char *ef_lower;
+    const uint64_t *ef_upper;
+    const uint64_t *ef_samples;
+    uint64_t ef_select(uint64_t i) const;
+    uint64_t ef_value(uint64_t i, uint64_t upper_pos) const;
+    uint64_t ef_at(uint64_t i) const;
   };
 
   class KrakenDB {
@@ -104,6 +120,9 @@ namespace kraken {
 
     size_t filesize() const;
 
+    // True if this is a compact (see compactdb.hpp) database
+    bool is_compact() const { return compact; }
+
     // Null constructor
     KrakenDB();
 
@@ -129,6 +148,21 @@ namespace kraken {
     uint64_t key_ct;
 
     uint64_t upper_bound(const uint64_t first, const uint64_t last);
+
+    // Compact database support
+    bool compact;
+    CompactKmerCodec codec;
+    uint64_t rec_bits;
+    unsigned dict_bits;
+    uint64_t dict_size;
+    const uint32_t *dict;
+    const char *cdata;
+    uint64_t cdata_bytes;
+    uint32_t *compact_query(uint64_t kmer, uint64_t *last_bin_key,
+                            int64_t *min_pos, int64_t *max_pos,
+                            bool retry_on_failure, bool use_chunks);
+    std::map<uint32_t,uint64_t> count_taxons_compact();
+    void prepare_chunking_compact(const uint64_t max_bytes_for_db);
 
     uint32_t _chunks;
     std::vector<uint64_t> idx_chunk_bounds;

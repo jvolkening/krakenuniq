@@ -16,7 +16,7 @@ endif
 
 CXXFLAGS = -Wall -Wextra -Wfatal-errors -pipe -O2 -std=c++11 $(FOPENMP) -I./gzstream $(NDEBUG) ${CPPFLAGS} 
 #CXXFLAGS = -Wall -std=c++11 $(FOPENMP) -O3 -Wfatal-errors
-PROGS1 = classify classifyExact db_sort set_lcas db_shrink build_taxdb read_uid_mapping count_unique dump_taxdb query_taxdb
+PROGS1 = classify classifyExact db_sort compact_db set_lcas db_shrink build_taxdb read_uid_mapping count_unique dump_taxdb query_taxdb
 TEST_PROGS = grade_classification test_hll_on_db dump_db_kmers
 #PROGS = $(PROGS1) $(TEST_PROGS)
 PROGS = $(PROGS1)
@@ -37,6 +37,8 @@ clean:
 db_shrink: krakendb.o quickfile.o
 
 db_sort: krakendb.o quickfile.o
+
+compact_db: krakendb.o quickfile.o
 
 set_lcas: set_lcas.cpp krakendb.o quickfile.o krakenutil.o seqreader.o uid_mapping.o
 	$(CXX) $(CXXFLAGS) -o set_lcas $^ $(LIBFLAGS)
@@ -71,7 +73,7 @@ read_uid_mapping: quickfile.o krakenutil.o uid_mapping.o
 krakenutil.o: krakenutil.cpp krakenutil.hpp taxdb.hpp report-cols.hpp
 	$(CXX) $(CXXFLAGS) -c krakenutil.cpp
 
-krakendb.o: krakendb.cpp krakendb.hpp quickfile.hpp
+krakendb.o: krakendb.cpp krakendb.hpp compactdb.hpp quickfile.hpp
 	$(CXX) $(CXXFLAGS) -c krakendb.cpp
 
 seqreader.o: seqreader.cpp seqreader.hpp quickfile.hpp
