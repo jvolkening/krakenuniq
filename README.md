@@ -13,6 +13,9 @@ We now have two standard Kraken1/KrakenUniq databases available for free downloa
 
 # Announcements
 
+## New release v1.2.0
+This release adds a `compact_db` tool which modifies an existing database to use Elias–Fano encoding, resulting in file sizes roughly 50% smaller for most large `database.kdb` files and smaller still for most `database.idx` files. Old-style, un-compacted databases are also still supported, and the `classify` tool will auto-detect the database format and act accordingly. These smaller database sizes reduce disk I/O costs and memory requirements, which can be bottlenecks on some systems, at a moderate CPU decoding cost during classification.
+
 ## New release v1.1.0
 This release updates `db_sort` and `set_lcas` with several optimizations enabling database building on machines with less available RAM than the database size (other build steps already allow this). It also bundles `jellyfish` v1.1.x directly (renamed as `krakenfish` to avoid conflicts with installed software) and includes the `ku_build` script as an alternative to `krakenuniq-build` for custom database construction.
 
