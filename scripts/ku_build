@@ -38,6 +38,7 @@ my $fn_compress;
 my $kmer_len = 31;
 my $minimizer_len = 15;
 my $validate = 0;
+my $no_compact = 0;
 
 GetOptions(
     'data=s' => \$dir_data,
@@ -51,6 +52,7 @@ GetOptions(
     'validate' => \$validate,
     'max_size=i' => \$max_size_gb,
     'work_in_memory' => \$work_in_memory,
+    'no_compact' => \$no_compact,
     'step=i' => \$step,
     'compress_to=s' => \$fn_compress,
     'k=i' => \$kmer_len,
@@ -123,9 +125,12 @@ if ($do_count) {
 sort_kmers( $KMERS_SHRUNK, $KMERS_SORTED, $INDEX )
     if ($do_sort);
 
-# steps 4-6 (now single step): compile full ID map, build taxDB, run set_lcas
-set_lcas( $KMERS_SORTED, $INDEX, $LCAS, $COUNTS, $FASTA_INPUTS )
-    if ($do_lcas);
+# steps 4-7: compile full ID map, build taxDB, run set_lcas, # run compact_db
+if ($do_lcas) {
+    set_lcas( $KMERS_SORTED, $INDEX, $LCAS, $COUNTS, $FASTA_INPUTS );
+    compact_db( $LCAS, $INDEX )
+        if (! $no_compact);
+}
 
 validate($FASTA_INPUTS)
     if ($validate);
@@ -662,7 +667,8 @@ sub validate {
         'unclassified' => 0,
     );
     my $tdb = "$dir_out/taxDB";
-    copy "$fn_taxdb", "$tdb";
+    copy "$fn_taxdb", "$tdb"
+        or die "Error copying taxDB to $tdb: $!";
     my @cmd = (
         'krakenuniq',
         '--db' => $dir_out,
@@ -712,6 +718,44 @@ sub validate {
     warn sprintf "Unclassified seqs: %s (%0.1f %%)\n",
         $status_counts{unclassified},
         $status_counts{unclassified}/$status_counts{total}*100;
+    return;
+
+}
+
+sub compact_db {
+
+    my ($fn_kdb, $fn_idx) = @_;
+
+    my $start = time;
+    warn "Compacting DB...\n";
+
+    my $tmp_kdb = pick_tmp_file(-s "$fn_kdb" + -s "$fn_idx")
+        // die "No scratch big enough to use for compacting\n";
+    my $tmp_idx = pick_tmp_file(-s "$fn_kdb" + -s "$fn_idx")
+        // die "No scratch big enough to use for compacting\n";
+    my $stderr;
+    my @cmd = (
+        "$KRAKEN_DIR/compact_db",
+        '-d' => "$fn_kdb",
+        '-i' => "$fn_idx",
+        '-o' => "$tmp_kdb",
+        '-x' => "$tmp_idx",
+    );
+    my $res = run \@cmd, '2>', \$stderr;
+    die "compact_db failed:\n$stderr"
+        if (! $res);
+    die "Missing compacted kdb"
+        if (! -r "$tmp_kdb");
+    die "Missing compacted idx"
+        if (! -r "$tmp_idx");
+    move "$tmp_kdb", "$fn_kdb"
+        or die "Error moving $tmp_kdb to $fn_kdb: $!\n";
+    move "$tmp_idx", "$fn_idx"
+        or die "Error moving $tmp_idx to $fn_idx: $!\n";
+
+    my $elapsed = time - $start;
+    warn "Done compacting database (took $elapsed s)\n";
+
     return;
 
 }
@@ -835,6 +879,8 @@ directory on disk. This directory will be used when insufficient space is
 available in C<--tmp_fast>. It should be set to the largest available
 temporary directory you have. Defaults to C<--tmp_fast> if not set.
 
+=item B<--help>
+
 Print usage description and exit
 
 =back
@@ -866,6 +912,13 @@ script by classifying all input sequences against the final database. This is
 generally a good idea to validate your database performance, but it can be
 quite slow for large databases and so is not performed by default. Default:
 off
+
+=item B<--no_compact>
+
+By default, the final database is compacted to use the new Elias-Fano-based
+format. Setting this flag will turn off the final compaction step (i.e. leave the
+final database in the classic, backward-compatible Kraken/KrakenUniq format).
+Default: unset
 
 =back
 
