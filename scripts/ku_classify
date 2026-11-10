@@ -1,0 +1,523 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use 5.012;
+use autodie;
+
+use BioX::Seq::Stream;
+use Cwd qw/getcwd abs_path/;
+use Getopt::Long;
+use File::Basename qw/basename dirname/;
+use File::Copy qw/copy move/;
+use File::Temp;
+use FindBin;
+use Fcntl;
+use IO::Handle;
+use IPC::Cmd qw/can_run/;
+use IPC::Run qw/run timeout/;
+use List::Util qw/max sum/;
+use Pod::Usage;
+use POSIX qw/ceil/;
+
+use constant PROGRAM => 'ku_classify';
+our $VERSION = 0.001;
+
+my @dirs_db;
+my $fi_taxdb;
+my $fo_class_reads;
+my $fo_unclass_reads;
+my $fo_results;
+my $fo_report;
+my $threads;
+my $quick = 0;
+my $min_hits = 0;
+my $paired = 0;
+my $hll_precision = 12;
+my $exact = 0;
+my $only_class = 0;
+my $print_seq = 0;
+my $cmd_line = join ' ', $0, @ARGV;
+
+GetOptions(
+    'db=s' => \@dirs_db,
+    'taxdb=s' => \$fi_taxdb,
+    'classified_reads=s' => \$fo_class_reads,
+    'unclassified_reads=s' => \$fo_unclass_reads,
+    'out=s' => \$fo_results,
+    'report=s' => \$fo_report,
+    'threads=i' => \$threads,
+    'quick' => \$quick,
+    'min_hits=i' => \$min_hits,
+    'paired' => \$paired,
+    'hll_precision=i' => \$hll_precision,
+    'exact' => \$exact,
+    'only_classified' => \$only_class,
+    'print_sequence' => \$print_seq,
+    'help' => sub{ pod2usage(-verbose => 2, -exitval => 0); },
+    'version' => sub{ say 'This is ', PROGRAM,' v', $VERSION; exit },
+) or pod2usage( -verbose  => 1);
+
+if ($min_hits && ! $quick) {
+    warn "Note: setting --min_hits implies --quick, adding --quick\n";
+    $quick = 1;
+}
+if ($threads !~ /^\d+$/ || $threads < 1) {
+    die_w_usage( "Error: --threads must be a positive integer\n" );
+}
+if (! scalar @dirs_db) {
+    die_w_usage( "Error: must specify at least one database with --db\n" );
+}
+if (! defined $fi_taxdb) {
+    die_w_usage( "Error: must specify path to taxDB file (--taxdb)\n" );
+}
+if (! -r $fi_taxdb) {
+    die "Error: Specified taxDB file ($fi_taxdb) is not readable\n";
+}
+
+my @fns_reads = @ARGV;
+if (! scalar @fns_reads) {
+    die_w_usage( "Error: Must specify at least one input file\n" );
+}
+if ($paired && scalar(@fns_reads) != 2) {
+    die_w_usage( "Error: Exactly two inputs are required with --paired\n" );
+}
+
+my ($fns_kdb, $fns_idx, $fn_uid_map) = verify_dbs(@dirs_db);
+
+# set some initial static values
+my $KRAKEN_DIR = locate_install();
+my $THREADS = $threads // calc_threads();
+my $CLASSIFIER = $exact
+    ? "$KRAKEN_DIR/classify"
+    : "$KRAKEN_DIR/classifyExact";
+if (! -e $CLASSIFIER) {
+    die "Error: Failed to find classifier at $CLASSIFIER\n";
+}
+elsif (! -x $CLASSIFIER) {
+    die "Error: Classifier $CLASSIFIER is not executable\n";
+}
+
+# set flags for classifier
+my @flags;
+push @flags, map { ("-d", $_) } @{ $fns_kdb };
+push @flags, map { ("-i", $_) } @{ $fns_idx };
+push @flags, "-a", $fi_taxdb;
+push @flags, "-t", $THREADS;
+push @flags, "-p", $hll_precision;
+push @flags, "-q"
+    if $quick;
+push @flags, "-m", $min_hits
+    if $min_hits > 1;
+push @flags, "-U", $fo_unclass_reads
+    if defined $fo_unclass_reads;
+push @flags, "-C", $fo_class_reads
+    if defined $fo_class_reads;
+push @flags, "-o", $fo_results
+    if defined $fo_results;
+push @flags, "-r", $fo_report
+    if defined $fo_report;
+push @flags, "-c"
+    if $only_class;
+push @flags, "-s"
+    if $print_seq;
+
+if (defined $fn_uid_map) {
+    push @flags, "-I", $fn_uid_map; 
+}
+
+# auto-calculate preloading
+my $available_mem = total_memory() * 0.9;
+my $total_db_size = sum map {-s $_} @{ $fns_kdb }, @{ $fns_idx };
+if ($total_db_size <= $available_mem) {
+    push @flags, '-M'; # --preload
+}
+elsif (scalar @dirs_db < 2) {
+    my $mem_string = int($available_mem / 1024**3) . 'G';
+    push @flags, '-x', $mem_string; # --preload-size
+}
+
+my $tmp_in = merge_inputs(\@fns_reads, $paired);
+
+write_report_header(
+    $fo_report,
+    join(' ', @dirs_db),
+    (-s $fns_kdb->[0]),
+    getcwd(),
+    $cmd_line
+);
+
+classify();
+
+
+sub classify {
+
+    my @cmd = (
+        $CLASSIFIER,
+        @flags,
+        "$tmp_in",
+    );
+    my $res = run \@cmd;
+    die "Error: classify failed:\n$1"
+        if (! $res);
+
+}
+
+sub locate_install {
+
+    my $KRAKENUNIQ_BUILD = can_run 'krakenuniq-build'
+        // die "KrakenUniq tools must be in PATH to use this script\n";
+    return dirname(abs_path($KRAKENUNIQ_BUILD));
+
+}
+
+sub total_memory {
+
+    die "System must support /proc/meminfo"
+        if (! -r '/proc/meminfo');
+    open my $stream, '<', '/proc/meminfo';
+    my $total;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my ($key, $value, $units) = split ' ', $line;
+        next if ($key ne 'MemTotal:');
+        die "Expected /proc/meminfo to report kB"
+            if ($units ne 'kB');
+        die "MemTotal value ($value) does not appear numeric"
+            if ($value !~ /^\d+$/);
+        $total = $value * 1024;
+        last;
+    }
+    close $stream
+        or die "Error reading from /proc/meminfo: $!";
+    die "Failed to parse available memory from proc/meminfo"
+        if (! defined $total);
+    return $total;
+
+}
+
+sub calc_threads {
+
+    die "System must support /proc/cpuinfo"
+        if (! -r '/proc/cpuinfo');
+    my $n_cpus;
+    open my $stream, '<', '/proc/cpuinfo';
+    while (my $line = <$stream>) {
+        chomp $line;
+        if ($line =~ /^processor\s*: (\d+)$/) {
+            $n_cpus = $1 + 1;
+        }
+    }
+    close $stream
+        or die "Error reading from /proc/cpuinfo: $!";
+    die "Failed to parse CPU count from /proc/cpuinfo"
+        if (! defined $n_cpus);
+    return $n_cpus;
+
+}
+
+sub verify_dbs {
+
+    my @dirs = @_;
+
+    my @kdbs;
+    my @idxs;
+    my $fn_uid_map;
+
+    if (! scalar @dirs) {
+        die "Error: must specify at least one input database\n";
+    }
+
+    for my $dir (@dirs) {
+
+        die "Invalid --db ($dir): not a directory\n"
+            if (! -d $dir);
+        my $fn_kdb = "$dir/database.kdb";
+        my $fn_uid = "$dir/uid_database.kdb";
+        my $fn_idx = "$dir/database.idx";
+        if (-e $fn_uid) {
+            die "Invalid --db ($dir): multiple formats found\n"
+                if (-e $fn_kdb);
+            my $fn_map = "$dir/uid_to_taxid.map";
+            die "Invalid --db ($dir): UID database detected but missing"
+                . " required map file (uid_to_taxid.map)"
+                if (-e $fn_uid_map);
+            $fn_uid_map //= $fn_map;
+            push @kdbs, $fn_uid;
+        }
+        elsif (-e $fn_kdb) {
+            die "Invalid --db ($dir): multiple formats found\n"
+                if (defined $fn_uid_map);
+            push @kdbs, $fn_kdb;
+        }
+        else {
+            die "Invalid --db ($dir): no kdb found\n";
+        }
+        if (-e $fn_idx) {
+            push @idxs, $fn_idx;
+        }
+        else {
+            die "Invalid --db ($dir): no idx found\n";
+        }
+
+    }
+
+    return
+        \@kdbs,
+        \@idxs,
+        $fn_uid_map;
+
+}
+
+sub die_w_usage {
+
+    my ($msg) = @_;
+    warn $msg;
+    pod2usage(-verbose => 2, -exitval => 1);
+
+}
+
+sub merge_inputs {
+
+    my ($fns, $paired) = @_;
+
+    for my $fn (@{ $fns }) {
+        die "Input file $fn not readable\n"
+            if (! -r $fn);
+    }
+
+    my $tmp = File::Temp->new();
+
+    if ($paired) {
+        my $fn_1 = $fns->[0]
+            // die "Internal error: no first paired file\n";
+        my $fn_2 = $fns->[1]
+            // die "Internal error: no second paired file\n";
+        my $p1 = BioX::Seq::Stream->new($fn_1);
+        my $p2 = BioX::Seq::Stream->new($fn_2);
+        while (my $s1 = $p1->next_seq) {
+            my $s2 = $p2->next_seq()
+                // die "Error: Uneven read counts in paired inputs";
+            print {$tmp} BioX::Seq->new(
+                join('N', $s1->seq, $s2->seq),
+                $s1->id
+            )->as_fasta;
+        }
+        die "Error: Uneven read counts in paired inputs"
+            if (defined $p2->next_seq);
+    }
+    else {
+        for my $fn (@{ $fns }) {
+            my $p = BioX::Seq::Stream->new($fn);
+            while (my $s = $p->next_seq) {
+                print {$tmp} $s->as_fasta;
+            }
+        }
+    }
+
+    close $tmp;
+    return $tmp;
+
+}
+
+sub write_report_header {
+
+    my ($fn, $db_string, $db_size, $wd, $cmd) = @_;
+
+    return if (! defined $fn);
+    my $date = localtime()->strftime('%Y-%m-%dT%H:%M:%SZ');
+    open my $out, '>', $fn;
+    say {$out} join ' ',
+        '#',
+        'KrakenUniq',
+        'v#####=VERSION=#####',
+        "DATE:$date",
+        "DB:$db_string",
+        "DB_SIZE:$db_size",
+        "WD:$wd",
+    ;
+    say {$out} "# CL:$cmd";
+    close $out;
+
+}
+
+__END__
+
+=head1 NAME
+
+ku_classify - an alternative wrapper to KrakenUniq classifier
+
+=head1 SYNOPSIS
+
+    ku_classify \
+        --data <path_to_FASTA_and_MAP_directory> \
+        --out <path_to_output_database_directory> \
+        --k <kmer_length> \
+        --max_size <size_in_GB> \
+        --taxdb <path_to_taxDB_file> \
+        --validate \
+        --compress_to <path_to_tar.zst_of_database> \
+        --tmp_fast <path_to_SSD_tmp_space> \
+        --tmp_big <path_to_large_tmp_space>
+
+=head1 DESCRIPTION
+
+C<ku_build> is an alternative to C<krakenuniq-build> that removes some
+features (such as data and taxonomy downloads) and focuses on providing a
+robust, configurable, and flexible build process on limited hardware. It
+auto-calculates parameters (such as jellyfish hash size) where possible and
+does additional checks of available memory and disk space before beginning
+each stage of the build process. It also modifies some default values of each
+build step in order to minimize the necessary disk space and succeed with the
+available RAM on the system.
+
+=head1 PREREQUISITES
+
+All preqrequisites are installed alongside C<ku_build> as part of the
+C<krakneuniq> distribution. The script itself uses only core Perl modules.
+
+=head1 OPTIONS
+
+=head2 Input
+
+=over 4
+
+=item B<--data> I<directory_path>
+
+(required) Path to a directory containing FASTA genome sequences and accompanying
+taxonomic map files. See L<Input Data> below for a description of the expected
+format and arrangement. No default.
+
+=item B<--taxDB> I<file_path>
+
+(reqiured) Path to the taxDB file to be used for the database build. See
+L<Input Data> below for a discussion of how to generate this file.
+No default.
+
+=back
+
+=head2 Output 
+
+=over 4
+
+=item B<--out> I<directory_path>
+
+(reqiured) Path to the directory where the final database files will be written.
+No default.
+
+=item B<--compress_to> I<file_path>
+
+(optional) Location to save a ZSTD-compressed tarball of the final database.
+See L<Output Files> below for a further discussion. No default.
+
+=back
+
+=head2 Configuration 
+
+=over 4
+
+=item B<--k> I<integer>
+
+K-mer length to use for the database. Default: 31
+
+=item B<--minimizer> I<integer>
+
+Minimizer length to use (default: 15)
+
+=item B<--max_size> I<integer>
+
+Maximum final database size, in GiB. Kmers will be randomly downsampled to fit
+into this limit. Default: none
+
+=item B<--step> I<integer>
+
+Increasing this value will cause jellyfish to only record every C<step-size>
+kmers, instead of every unique kmer. This is an alternative approach to
+C<--max_size> to downsample the database; C<max_size> should be preferred, but
+this parameter will downsample prior to writing the initial k-mer database and
+can allow a database to be built where the full k-mer count file wouldn't
+otherwise fit in available disk space. Default: 1
+
+=item B<--work_in_memory>
+
+By default, some underlying steps will work on disk if not enough memory is
+available to load the entire database. Setting this flag will force those
+programs to only work in memory; they will throw OOM errors if the system
+doesn't have sufficient memory for this. Generally, you'll want to leave this
+unset and let the underlying tools make these decisions. Default: off
+
+=item B<--tmp_fast> I<directory_path>
+
+At minimum, either this parameter or C<--tmp_big> must be set to a temporary
+directory on disk. This directory will be used for disk I/O-heavy steps if it
+has enough free space. Typically this will be a NVMe drive or at least a SATA
+SSD. Defaults to C<--tmp_big> if not set.
+
+=item B<--tmp_big> I<directory_path>
+
+At minimum, either this parameter or C<--tmp_fast> must be set to a temporary
+directory on disk. This directory will be used when insufficient space is
+available in C<--tmp_fast>. It should be set to the largest available
+temporary directory you have. Defaults to C<--tmp_fast> if not set.
+
+Print usage description and exit
+
+=back
+
+=head2 Workflow
+
+By default, the entire database building workflow will run except for
+validation. The following options can be used to adjust which step the
+workflow will run through.
+
+=over 4
+
+=item B<--count>
+
+Perform k-mer counting (and shrinking if necessary) and stop.
+
+=item B<--sort>
+
+Perform database build through the C<sort> step and stop.
+
+=item B<--set_lcas>
+
+Perform database build through the C<set_lcas> step and stop.
+
+=item B<--validate>
+
+Perform the same database validation as the original C<krakenuniq-build>
+script by classifying all input sequences against the final database. This is
+generally a good idea to validate your database performance, but it can be
+quite slow for large databases and so is not performed by default. Default:
+off
+
+=back
+
+=head1 CAVEATS AND BUGS
+
+Please submit bug reports to the issue tracker in the distribution repository.
+
+=head1 AUTHOR
+
+Jeremy Volkening (jeremy.volkening@base2bio.com)
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright 2026 Jeremy Volkening
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
+
