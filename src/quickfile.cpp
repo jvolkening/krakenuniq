@@ -71,11 +71,14 @@ void QuickFile::open_file(string filename_str, string mode, size_t size) {
   }
 
   fptr = (char *)mmap(0, filesize, m_prot, m_flags, fd, 0);
-  madvise(fptr, filesize, MADV_WILLNEED);
   if (fptr == MAP_FAILED)
     err(EX_OSERR, "unable to mmap %s", filename);
+  if (willneed_on_open)
+    madvise(fptr, filesize, MADV_WILLNEED);
   valid = true;
 }
+
+bool QuickFile::willneed_on_open = true;
 
 void QuickFile::load_file() {
   if (mlock(fptr,filesize) != 0){

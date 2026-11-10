@@ -29,6 +29,53 @@ run_case() {
   cmp "$D/orig.out" "$D/compact.out"
   cmp "$D/orig.out" "$D/compact_mem.out"
   cmp "$D/orig.report" "$D/compact.report"
+  if [ "$K" = 31 ] && [ "$NT" = 10 ]; then
+    # A second database has the same keys but conflicting taxids, making
+    # first-database precedence observable.
+    cp "$D/db.kdb" "$D/conflict.kdb"
+    python3 - "$D/conflict.kdb" <<'PYEOF'
+import struct, sys
+with open(sys.argv[1], 'r+b') as f:
+    data = bytearray(f.read())
+    header = 72 + 2 * (4 + 8 * 62)
+    for pos in range(header + 8, len(data), 12):
+        struct.pack_into('<I', data, pos, 100)
+    f.seek(0)
+    f.write(data)
+PYEOF
+    cp "$D/reads.fa" "$D/batch.fa"
+    printf '>short\nACGT\n>ambiguous\nNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN\n' >> "$D/batch.fa"
+    awk 'NR % 2 {id=substr($0,2); next} {print "@" id "\n" $0 "\n+"; gsub(/./,"I"); print}' \
+      "$D/batch.fa" > "$D/batch.fq"
+    for input in "$D/batch.fa" "$D/batch.fq"; do
+      for order in plain compact; do
+        if [ "$order" = plain ]; then
+          db1="$D/db.kdb"; idx1="$D/db.idx"
+          db2="$D/db.kdbc"; idx2="$D/db.idxc"
+        else
+          db1="$D/db.kdbc"; idx1="$D/db.idxc"
+          db2="$D/conflict.kdb"; idx2="$D/db.idx"
+        fi
+        common=(-d "$db1" -i "$idx1" -d "$db2" -i "$idx2"
+                -d "$D/conflict.kdb" -i "$D/db.idx" -a "$D/taxDB" -t 1 -u 5000)
+        "$SRC/classify" "${common[@]}" -B 0 -o "$D/baseline.out" -r "$D/baseline.report" \
+          -C "$D/baseline.classified" -U "$D/baseline.unclassified" "$input" 2>/dev/null
+        KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" "${common[@]}" -B 6000 \
+          -o "$D/batch.out" -r "$D/batch.report" -C "$D/batch.classified" \
+          -U "$D/batch.unclassified" "$input" 2>/dev/null
+        cmp "$D/baseline.out" "$D/batch.out"
+        cmp "$D/baseline.report" "$D/batch.report"
+        cmp "$D/baseline.classified" "$D/batch.classified"
+        cmp "$D/baseline.unclassified" "$D/batch.unclassified"
+        rm "$D/baseline.report" "$D/batch.report"
+      done
+    done
+    if "$SRC/classify" -B nonsense 2>"$D/invalid.err"; then
+      echo "invalid batch size accepted"; exit 1
+    fi
+    grep -q "invalid batch size" "$D/invalid.err"
+    echo "hierarchical batch output matches the per-read path"
+  fi
   # chunked mode, small chunks (forces several chunks)
   local CH=$(( $(stat -c %s "$D/db.kdbc") / 5 ))
   classify orig_chunk "$D/db.kdb" "$D/db.idx" -x $(( $(stat -c %s "$D/db.kdb") / 5 + $(stat -c %s "$D/db.idx") ))

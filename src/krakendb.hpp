@@ -42,6 +42,10 @@ namespace kraken {
     uint64_t *get_array();
     uint64_t at(uint64_t idx);
 
+    // Batch-lookup helpers: prefetch the index data needed for a bin and
+    // return the address of the index entry (for paging hints; may be NULL)
+    const char *prefetch_bin(uint64_t bin);
+
     // Compact (Elias-Fano) indexes only: start/end record of a bin
     bool is_compact() const { return idx_type == 3; }
     void bin_range(uint64_t bin, uint64_t *start, uint64_t *end);
@@ -131,6 +135,14 @@ namespace kraken {
 
     ~KrakenDB();
 
+    // Batch lookup support (see classify.cpp): bin of a canonical k-mer,
+    // and the byte range of the mapped DB file holding the bin's records.
+    // Queries sorted by bin touch the file in increasing offset order.
+    uint64_t bin_of(uint64_t kmer);
+    void bin_bytes(uint64_t bin, const char **lo, const char **hi);
+    // Same result as kmer_query(kmer), given bin == bin_of(kmer)
+    uint32_t *kmer_query_in_bin(uint64_t kmer, uint64_t bin);
+
     uint32_t chunks() const;
     void load_chunk(const uint32_t db_chunk_id);
     void prepare_chunking(const uint64_t max_bytes_for_db);
@@ -148,6 +160,7 @@ namespace kraken {
     uint64_t key_ct;
 
     uint64_t upper_bound(const uint64_t first, const uint64_t last);
+    uint64_t min_bin_key(uint64_t kmer, uint8_t nt, uint64_t xor_mask);
 
     // Compact database support
     bool compact;

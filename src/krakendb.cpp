@@ -270,17 +270,23 @@ size_t KrakenDB::header_size() { return 72 + 2 * (4 + 8 * key_bits); }
 // The bin key is the m-mer whose canonical representation is "smallest"
 // ("smallest" can refer to lexico. ordering or some other ordering)
 uint64_t KrakenDB::bin_key(uint64_t kmer, uint64_t idx_nt) {
-  uint8_t nt = idx_nt;
-  uint64_t xor_mask = INDEX2_XOR_MASK;
-  uint64_t mask = 1 << (nt * 2);
-  mask--;
+  return min_bin_key(kmer, idx_nt, INDEX2_XOR_MASK);
+}
+
+// The reverse complement of each m-mer window is a window of the reverse
+// complement of the whole k-mer, so it is computed only once per k-mer.
+uint64_t KrakenDB::min_bin_key(uint64_t kmer, uint8_t nt, uint64_t xor_mask) {
+  const unsigned kk = key_bits / 2;
+  const uint64_t mask = (1ull << (nt * 2)) - 1;
   xor_mask &= mask;
+  const uint64_t revcom = reverse_complement(kmer, kk);
   uint64_t min_bin_key = ~0;
-  for (uint64_t i = 0; i < key_bits / 2 - nt + 1; i++) {
-    uint64_t temp_bin_key = xor_mask ^ canonical_representation(kmer & mask, nt);
+  for (unsigned i = 0; i < kk - nt + 1; i++) {
+    const uint64_t fwd = (kmer >> (2 * i)) & mask;
+    const uint64_t rev = (revcom >> (2 * (kk - nt - i))) & mask;
+    const uint64_t temp_bin_key = xor_mask ^ (fwd < rev ? fwd : rev);
     if (temp_bin_key < min_bin_key)
       min_bin_key = temp_bin_key;
-    kmer >>= 2;
   }
   return min_bin_key;
 }
@@ -290,18 +296,7 @@ uint64_t KrakenDB::bin_key(uint64_t kmer, uint64_t idx_nt) {
 uint64_t KrakenDB::bin_key(uint64_t kmer) {
   uint8_t nt = index_ptr->indexed_nt();
   uint8_t idx_type = index_ptr->index_type();
-  uint64_t xor_mask = idx_type == 1 ? 0 : INDEX2_XOR_MASK;
-  uint64_t mask = 1 << (nt * 2);
-  mask--;
-  xor_mask &= mask;
-  uint64_t min_bin_key = ~0;
-  for (uint64_t i = 0; i < key_bits / 2 - nt + 1; i++) {
-    uint64_t temp_bin_key = xor_mask ^ canonical_representation(kmer & mask, nt);
-    if (temp_bin_key < min_bin_key)
-      min_bin_key = temp_bin_key;
-    kmer >>= 2;
-  }
-  return min_bin_key;
+  return min_bin_key(kmer, nt, idx_type == 1 ? 0 : INDEX2_XOR_MASK);
 }
 
 // Code mostly from Jellyfish 1.6 source
@@ -461,6 +456,61 @@ uint32_t *KrakenDB::compact_query(uint64_t kmer, uint64_t *last_bin_key,
       uint64_t di = compact_read_bits(base, pos + t_bits, dict_bits);
       return di < dict_size ? (uint32_t *) &dict[di] : NULL;
     }
+  }
+  return NULL;
+}
+
+uint64_t KrakenDB::bin_of(uint64_t kmer) {
+  if (compact) {
+    uint64_t b_key, t;
+    codec.encode(kmer, &b_key, &t);
+    return b_key;
+  }
+  return bin_key(kmer);
+}
+
+void KrakenDB::bin_bytes(uint64_t bin, const char **lo, const char **hi) {
+  uint64_t start, end;
+  index_ptr->bin_range(bin, &start, &end);
+  if (compact) {
+    *lo = cdata + ((start * rec_bits) >> 3);
+    *hi = cdata + ((end * rec_bits + 7) >> 3) + 8;
+  } else {
+    *lo = get_pair_ptr() + start * pair_size();
+    *hi = get_pair_ptr() + end * pair_size();
+  }
+}
+
+uint32_t *KrakenDB::kmer_query_in_bin(uint64_t kmer, uint64_t bin) {
+  if (compact) {
+    uint64_t b_key = bin;
+    int64_t min = 0, max = -1;
+    return compact_query(kmer, &b_key, &min, &max, false, false);
+  }
+  int64_t min = index_ptr->at(bin);
+  int64_t max = index_ptr->at(bin + 1) - 1;
+  const char *ptr = get_pair_ptr();
+  const size_t pair_sz = pair_size();
+  const uint64_t key_mask = (1ull << key_bits) - 1;
+  uint64_t comp_kmer;
+  while (min + 15 <= max) {
+    int64_t mid = min + (max - min) / 2;
+    comp_kmer = 0;
+    memcpy(&comp_kmer, ptr + pair_sz * mid, key_len);
+    comp_kmer &= key_mask;
+    if (kmer > comp_kmer)
+      min = mid + 1;
+    else if (kmer < comp_kmer)
+      max = mid - 1;
+    else
+      return (uint32_t *) (ptr + pair_sz * mid + key_len);
+  }
+  for (int64_t mid = min; mid <= max; mid++) {
+    comp_kmer = 0;
+    memcpy(&comp_kmer, ptr + pair_sz * mid, key_len);
+    comp_kmer &= key_mask;
+    if (kmer == comp_kmer)
+      return (uint32_t *) (ptr + pair_sz * mid + key_len);
   }
   return NULL;
 }
@@ -814,6 +864,18 @@ void KrakenDBIndex::bin_range(uint64_t bin, uint64_t *start, uint64_t *end) {
   while (word == 0)
     word = ef_upper[++w];
   *end = ef_value(bin + 1, w * 64 + __builtin_ctzll(word));
+}
+
+const char *KrakenDBIndex::prefetch_bin(uint64_t bin) {
+  const char *p;
+  if (idx_type == 3) {
+    __builtin_prefetch(ef_samples + (bin >> COMPACT_SELECT_SHIFT));
+    p = ef_lower + ((bin * ef_l) >> 3);
+  } else {
+    p = (const char *) (get_array() + bin);
+  }
+  __builtin_prefetch(p);
+  return p;
 }
 
 // Index version (v2 uses different minimizer sort order)
