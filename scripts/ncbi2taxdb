@@ -1,0 +1,136 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use 5.012;
+use autodie;
+
+use IPC::Cmd qw/can_run/;
+
+use constant UNCLASSIFIED => 12908;
+
+my ($fi_dump) = @ARGV;
+
+die "Must specify input file\n"
+    if (! defined $fi_dump);
+die "Input file $fi_dump not readable"
+    if (! -r $fi_dump);
+my $TAR = can_run 'tar'
+    // die "Requires 'tar' in PATH but not found\n";
+my @tar_cmd = (
+    $TAR,
+    '-xOf',
+    $fi_dump
+);
+
+my $names = parse_names();
+parse_nodes($names);
+parse_merged($names);
+parse_deleted($names);
+
+exit;
+
+sub parse_names {
+
+    my $n_col_expect = 4;
+    my $fn = 'names.dmp';
+    my %names;
+
+    open my $stream, '-|', @tar_cmd, $fn;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my @parts = split /\t\|\t?/, $line, -1;
+        my $n = scalar @parts - 1;
+        die "Invalid '$fn': expected $n_col_expect columns but found $n"
+            if ($n != $n_col_expect);
+        next if ($parts[3] ne 'scientific name');
+        $names{$parts[0]} = $parts[1];
+    }
+    close $stream
+        or die "Error extracting $fn using tar: $!\n";
+
+    return \%names;
+
+}
+
+sub parse_nodes {
+
+    my ($names) = @_;
+    my $n_col_expect = 13;
+    my $fn = 'nodes.dmp';
+
+    open my $stream, '-|', @tar_cmd, $fn;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my @parts = split /\t\|\t?/, $line, -1;
+        my $n = scalar @parts - 1;
+        die "Invalid '$fn': expected $n_col_expect columns but found $n"
+            if ($n != $n_col_expect);
+        my ($node, $parent, $rank) = @parts[0..2];
+        my $name = $names->{$node}
+            // die "Missing name for node $node";
+        say join "\t",
+            $node,
+            $parent,
+            $name,
+            $rank,
+        ;
+    }
+    close $stream
+        or die "Error extracting $fn using tar: $!\n";
+
+}
+
+sub parse_merged {
+
+    my ($names) = @_;
+    my $n_col_expect = 2;
+    my $fn = 'merged.dmp';
+
+    open my $stream, '-|', @tar_cmd, $fn;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my @parts = split /\t\|\t?/, $line, -1;
+        my $n = scalar @parts - 1;
+        die "Invalid '$fn': expected $n_col_expect columns but found $n"
+            if ($n != $n_col_expect);
+        my ($old, $new) = @parts[0..1];
+        my $name = $names->{$new}
+            // die "Missing name for node $new";
+        say join "\t",
+            $old,
+            $new,
+            $name,
+            'no rank',
+        ;
+    }
+    close $stream
+        or die "Error extracting $fn using tar: $!\n";
+
+}
+
+sub parse_deleted {
+
+    my ($names) = @_;
+    my $n_col_expect = 1;
+    my $fn = 'delnodes.dmp';
+
+    open my $stream, '-|', @tar_cmd, $fn;
+    while (my $line = <$stream>) {
+        chomp $line;
+        my @parts = split /\t\|\t?/, $line, -1;
+        my $n = scalar @parts - 1;
+        die "Invalid '$fn': expected $n_col_expect columns but found $n"
+            if ($n != $n_col_expect);
+        my $id = $parts[0];
+        say join "\t",
+            $id,
+            UNCLASSIFIED,
+            'Deleted',
+            'no rank',
+        ;
+    }
+    close $stream
+        or die "Error extracting $fn using tar: $!\n";
+
+}
