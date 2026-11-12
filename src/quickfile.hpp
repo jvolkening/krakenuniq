@@ -35,6 +35,8 @@ namespace kraken {
     size_t size();
     void load_file();
     void sync_file();
+    // If false, open_file() does not ask the kernel to read in the whole file
+    static bool willneed_on_open;
     void close_file();
 
     protected:

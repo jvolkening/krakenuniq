@@ -13,6 +13,26 @@ We now have two standard Kraken1/KrakenUniq databases available for free downloa
 
 # Announcements
 
+## New release v1.3.0
+This release introduces batch processing of the input reads when performing a hierarchical search on multiple databases with `classify`. In cases where all databases do not fit into memory at the same time, this feature should significantly speed up searches due to reduced traversals of the databases and consequently reduced major page faults. The batch size is configurable (16M default) via `--batch-size` in `krakenuniq` or `-B` in `classify`, and batching can be disabled by setting this value to `0`.
+
+The following table shows metrics from a limited benchmark, searching two public datasets against a set of 11 hierarchical databases of varying size (three of which are ~ 100 GB uncompacted and ~ 50 GB compacted):
+
+| reads | version | compacted? | block size | system RAM | elapsed (min) | memory (GB) | avg CPU | major page faults |
+|----|----|----|----|----|----|----|----|----|
+| SRR22262949 | 1.0.4 | N | NA | 256 | 1.5e+02 ± 28 | 2.1e+02 ± 4.4 | 11 ± 1.73 | 1.2e+07 ± 4.38e+05 |
+| SRR22262949 | 1.2.0 | Y | NA | 64 | 40 ± 0.41 | 45 ± 0.43 | 91.7 ± 3.06 | 2.77e+07 ± 1.14e+05 |
+| SRR22262949 | 1.3.0 | Y | 16M | 64 | 7.1 ± 0.079 | 55 ± 0.22 | 294 ± 3.06 | 1.53e+06 ± 2.07e+04 |
+| SRR22262949 | 1.3.0 | Y | 256M | 64 | 3.9 ± 0.19 | 59 ± 0.57 | 472 ± 13.5 | 5.23e+05 ± 2.55e+04 |
+| SRR22262949 | 1.3.0 | Y | 512M | 64 | 3.8 ± 0.13 | 60 ± 0.23 | 471 ± 8.14 | 4.81e+05 ± 1.94e+03 |
+| SRR22262949 | 1.3.0 | Y | 64M | 64 | 5.9 ± 0.23 | 57 ± 0.41 | 332 ± 8.96 | 9.48e+05 ± 1.22e+04 |
+| SRR3578145 | 1.0.4 | N | NA | 256 | 12 ± 9.1 | 1.1e+02 ± 0.78 | 24 ± 12.3 | 8.93e+05 ± 7.2e+05 |
+| SRR3578145 | 1.2.0 | Y | NA | 64 | 1.7 ± 0.1 | 44 ± 0.4 | 139 ± 5.86 | 1.02e+06 ± 4.94e+04 |
+| SRR3578145 | 1.3.0 | Y | 16M | 64 | 0.56 ± 0.00024 | 40 ± 0.01 | 460 ± 7.07 | 9.66e+04 ± 203 |
+| SRR3578145 | 1.3.0 | Y | 256M | 64 | 0.68 ± 0.1 | 36 ± 0.83 | 397 ± 35.8 | 9e+04 ± 6.24e+03 |
+| SRR3578145 | 1.3.0 | Y | 512M | 64 | 0.72 ± 0.082 | 34 ± 1.1 | 374 ± 9.54 | 9.69e+04 ± 228 |
+| SRR3578145 | 1.3.0 | Y | 64M | 64 | 0.58 ± 0.012 | 39 ± 1.1 | 440 ± 15.6 | 8.47e+04 ± 4.78e+03 |
+
 ## New release v1.2.0
 This release adds a `compact_db` tool which modifies an existing database to use Elias–Fano encoding, resulting in file sizes roughly 50% smaller for most large `database.kdb` files and smaller still for most `database.idx` files. Old-style, un-compacted databases are also still supported, and the `classify` tool will auto-detect the database format and act accordingly. These smaller database sizes reduce disk I/O costs and memory requirements, which can be bottlenecks on some systems, at a moderate CPU decoding cost during classification.
 

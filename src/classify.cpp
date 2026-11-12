@@ -30,12 +30,17 @@
 #include "gzstream.h"
 #include "uid_mapping.hpp"
 #include <sstream>
+#include <sys/mman.h>
+#if defined(_OPENMP) && defined(__GLIBCXX__)
+#include <parallel/algorithm>
+#endif
 #include <inttypes.h>
 #include <cassert>
 #include <cstdio>
 #include <inttypes.h>
 
 const size_t DEF_WORK_UNIT_SIZE = 500000;
+const size_t DEF_BATCH_SIZE = 16000000;
 int New_taxid_start = 1000000000;
 
 using namespace std;
@@ -68,6 +73,13 @@ void classify_sequence_with_db_chunk(std::pair<DNASequence, uint32_t> & seq, std
 bool classify_sequence(DNASequence &dna, ostringstream &koss,
                        ostringstream &coss, ostringstream &uoss,
                        unordered_map<uint32_t, READCOUNTS>&);
+bool finish_classification(DNASequence &dna, const vector<uint32_t> &taxa,
+                           const vector<char> &ambig_list,
+                           unordered_map<uint32_t, uint32_t> &hit_counts,
+                           uint32_t hits, uint32_t taxon, ostringstream &koss,
+                           ostringstream &coss, ostringstream &uoss,
+                           unordered_map<uint32_t, READCOUNTS>& my_taxon_counts);
+void process_file_batched(char *filename);
 inline void print_sequence(ostream* oss_ptr, const DNASequence& dna);
 string hitlist_string(const vector<uint32_t> &taxa, const vector<char>& ambig_list);
 
@@ -109,6 +121,10 @@ ostream *Report_output;
 vector<ofstream*> Open_fstreams;
 vector<ogzstream*> Open_gzstreams;
 size_t Work_unit_size = DEF_WORK_UNIT_SIZE;
+size_t Batch_size = DEF_BATCH_SIZE;  // bp per batch of reads; 0 = classify read by read
+bool Page_hints = true;
+// Mapped DB/index files (address, size), filled in by main()
+static vector<std::pair<const char *, size_t> > Db_maps, Idx_maps;
 TaxonomyDB<uint32_t> taxdb;
 static vector<KrakenDB*> KrakenDatabases (DB_filenames.size());
 
@@ -177,6 +193,10 @@ int main(int argc, char **argv) {
   static vector<KrakenDBIndex> db_indices (DB_filenames.size());
 
 
+  const bool batch_mode = Batch_size > 0 && !Quick_mode && !(Populate_memory && Populate_memory_size > 0);
+  if (batch_mode)
+    QuickFile::willneed_on_open = false;  // don't read whole (possibly huge) files in
+
   // TODO: Check DB_filenames and Index_filesnames have the same length
   for (size_t i=0; i < DB_filenames.size(); ++i) {
     cerr << " Database " << DB_filenames[i] << endl;
@@ -187,6 +207,8 @@ int main(int argc, char **argv) {
     // NOTE: we switched the order, i.e., we are creating the objects before loading everything into main memory
     db_indices[i] = KrakenDBIndex(idx_files[i].ptr());
     KrakenDatabases[i]->set_index(&db_indices[i]);
+    Db_maps.push_back(std::make_pair((const char *) db_files[i].ptr(), db_files[i].size()));
+    Idx_maps.push_back(std::make_pair((const char *) idx_files[i].ptr(), idx_files[i].size()));
 
     if (Populate_memory && Populate_memory_size == 0) // only when no chunk size is passed!
     {
@@ -250,6 +272,8 @@ int main(int argc, char **argv) {
   for (int i = optind; i < argc; i++) {
     if (Populate_memory && Populate_memory_size > 0)
       process_file_with_db_chunk(argv[i]);
+    else if (Batch_size > 0 && !Quick_mode)
+      process_file_batched(argv[i]);
     else
       process_file(argv[i]);
   }
@@ -559,6 +583,353 @@ void process_file(char *filename) {
       }
     }
   }  // end parallel section
+
+  delete reader;
+}
+
+// ---------------------------------------------------------------------------
+// Batched classification.
+//
+// Instead of looking up each k-mer in every database as it is scanned (random
+// access into databases that may be larger than RAM), a batch of reads is
+// processed in phases: (1) extract all canonical k-mers, (2) for each database
+// in turn, sort the still-unresolved k-mers by minimizer bin and look them up
+// in that order (so the DB file is read front to back, duplicate k-mers are
+// looked up once, and cache-line prefetches / paging hints are issued ahead of
+// the lookups), (3) assemble per-read results exactly as classify_sequence does.
+// The output is identical to the unbatched code (modulo read order with >1 thread).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct BatchQuery {
+  uint64_t bin;
+  uint64_t kmer;
+  uint32_t idx;   // position in the batch's flat k-mer array
+};
+
+inline bool batch_query_less(const BatchQuery &a, const BatchQuery &b) {
+  return a.bin != b.bin ? a.bin < b.bin : a.kmer < b.kmer;
+}
+
+enum : uint8_t { KM_PENDING = 0, KM_AMBIG = 1, KM_RESOLVED = 2 };
+
+const size_t PF_DIST_INDEX = 32;     // queries ahead: prefetch index cache line
+const size_t PF_DIST_DATA = 16;      // queries ahead: prefetch DB cache lines
+const size_t HINT_DIST_INDEX = 1024; // queries ahead: page-in hint for index
+const size_t HINT_DIST_DATA = 256;   // queries ahead: page-in hint for DB
+const size_t QUERY_CHUNK = 2048;     // queries per work item
+const size_t MAX_HINT_BYTES = 1 << 20;
+
+// Fraction of (sampled) pages of a mapping currently in the page cache
+double resident_fraction(const char *base, size_t size) {
+  const size_t page = getpagesize();
+  const size_t n_pages = size / page;
+  if (n_pages == 0)
+    return 1.0;
+  const size_t samples = std::min<size_t>(n_pages, 512);
+  size_t resident = 0, tested = 0;
+  for (size_t s = 0; s < samples; ++s) {
+    size_t p = (n_pages / samples) * s + (s * 7919) % std::max<size_t>(n_pages / samples, 1);
+    unsigned char vec = 0;
+    if (mincore((void *) (base + p * page), 1, &vec) == 0) {
+      ++tested;
+      resident += vec & 1;
+    }
+  }
+  return tested ? (double) resident / tested : 1.0;
+}
+
+inline void hint_range(const char *lo, const char *hi, const char **last_end) {
+  if (hi <= lo || (size_t)(hi - lo) > MAX_HINT_BYTES)
+    return;
+  const uintptr_t page = getpagesize();
+  uintptr_t a = (uintptr_t) lo & ~(page - 1);
+  uintptr_t b = ((uintptr_t) hi + page - 1) & ~(page - 1);
+  if ((uintptr_t) *last_end > a)  // queries are sorted: skip pages already hinted
+    a = (uintptr_t) *last_end;
+  if (a >= b)
+    return;
+  madvise((void *) a, b - a, MADV_WILLNEED);
+  *last_end = (const char *) b;
+}
+
+void lookup_sorted_queries(size_t db_id, const std::vector<BatchQuery> &qs,
+                           std::vector<uint32_t> &taxa, std::vector<uint8_t> &state,
+                           bool hints) {
+  KrakenDB *db = KrakenDatabases[db_id];
+  const size_t n = qs.size();
+  const size_t n_chunks = (n + QUERY_CHUNK - 1) / QUERY_CHUNK;
+
+  #ifdef _OPENMP
+  #pragma omp parallel for schedule(dynamic)
+  #endif
+  for (size_t c = 0; c < n_chunks; ++c) {
+    const size_t a = c * QUERY_CHUNK, b = std::min(n, a + QUERY_CHUNK);
+    const char *hinted_idx_end = NULL, *hinted_db_end = NULL;
+    uint64_t prev_kmer = ~0ull;
+    uint32_t prev_taxon = 0;
+    bool prev_found = false;
+
+    for (size_t j = a; j < b; ++j) {
+      if (hints && j + HINT_DIST_INDEX < b) {
+        const char *p = db->get_index()->prefetch_bin(qs[j + HINT_DIST_INDEX].bin);
+        hint_range(p, p + 16, &hinted_idx_end);
+      }
+      if (hints && j + HINT_DIST_DATA < b) {
+        const char *lo, *hi;
+        db->bin_bytes(qs[j + HINT_DIST_DATA].bin, &lo, &hi);
+        hint_range(lo, hi, &hinted_db_end);
+      }
+      if (j + PF_DIST_INDEX < b)
+        db->get_index()->prefetch_bin(qs[j + PF_DIST_INDEX].bin);
+      if (j + PF_DIST_DATA < b) {
+        const char *lo, *hi;
+        db->bin_bytes(qs[j + PF_DIST_DATA].bin, &lo, &hi);
+        __builtin_prefetch(lo);
+        __builtin_prefetch(lo + (hi - lo) / 2);
+        __builtin_prefetch(hi > lo ? hi - 1 : hi);
+      }
+
+      const BatchQuery &q = qs[j];
+      uint32_t taxon;
+      bool found;
+      if (j > a && q.kmer == prev_kmer) {
+        taxon = prev_taxon;
+        found = prev_found;
+      } else {
+        uint32_t *val_ptr = db->kmer_query_in_bin(q.kmer, q.bin);
+        found = val_ptr != NULL;
+        taxon = found ? *val_ptr : 0;
+        prev_kmer = q.kmer;
+        prev_taxon = taxon;
+        prev_found = found;
+      }
+      if (found) {
+        taxa[q.idx] = taxon;
+        state[q.idx] = KM_RESOLVED;
+      }
+    }
+  }
+}
+
+} // namespace
+
+void process_file_batched(char *filename) {
+  string file_str(filename);
+  DNASequenceReader *reader;
+  Fastq_input = determine_input_file_type(filename);
+  if (Fastq_input)
+    reader = new FastqReader(file_str);
+  else
+    reader = new FastaReader(file_str);
+
+  const size_t k = KrakenDatabases[0]->get_k();
+  const size_t n_dbs = KrakenDatabases.size();
+  vector<size_t> unit_start;
+
+  vector<DNASequence> reads;
+  vector<uint64_t> off, cnt;
+  vector<uint64_t> kmers;
+  vector<uint32_t> taxa;
+  vector<uint8_t> state;
+  #ifdef _OPENMP
+  const int n_threads = omp_get_max_threads();
+  #else
+  const int n_threads = 1;
+  #endif
+  vector<BatchQuery> qs;
+  vector<vector<BatchQuery> > local(n_threads);  // kept across batches to avoid page-faulting fresh memory
+
+  while (reader->is_valid()) {
+    reads.clear();
+    unit_start.clear();
+    size_t batch_nt = 0;
+    // A batch is made of whole work units, delimited like in process_file(),
+    // so that per-unit statistics are merged in the same way
+    while (batch_nt < Batch_size) {
+      const size_t first = reads.size();
+      size_t unit_nt = 0;
+      while (unit_nt < Work_unit_size) {
+        DNASequence dna = reader->next_sequence();
+        if (!reader->is_valid())
+          break;
+        unit_nt += dna.seq.size();
+        reads.push_back(std::move(dna));
+      }
+      if (reads.size() == first)
+        break;
+      unit_start.push_back(first);
+      batch_nt += unit_nt;
+    }
+    if (reads.empty())
+      break;
+    unit_start.push_back(reads.size());
+
+    const size_t n_reads = reads.size();
+    off.assign(n_reads + 1, 0);
+    for (size_t r = 0; r < n_reads; ++r)
+      off[r + 1] = off[r] + (reads[r].seq.size() >= k ? reads[r].seq.size() - k + 1 : 0);
+    const size_t total = off[n_reads];
+    if (total >= (1ull << 32))
+      errx(EX_USAGE, "batch too large (reduce -B)");
+    cnt.assign(n_reads, 0);
+    kmers.assign(total, 0);
+    taxa.assign(total, 0);
+    state.assign(total, KM_PENDING);
+
+    // Phase 1: k-mer extraction
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 64)
+    #endif
+    for (size_t r = 0; r < n_reads; ++r) {
+      if (reads[r].seq.size() < k)
+        continue;
+      KmerScanner scanner(reads[r].seq);
+      uint64_t *kmer_ptr;
+      size_t i = 0;
+      while ((kmer_ptr = scanner.next_kmer()) != NULL) {
+        if (scanner.ambig_kmer())
+          state[off[r] + i] = KM_AMBIG;
+        else
+          kmers[off[r] + i] = KrakenDatabases[0]->canonical_representation(*kmer_ptr);
+        ++i;
+      }
+      cnt[r] = i;
+    }
+    // Slots not produced by the scanner (should not happen) never get queried
+    for (size_t r = 0; r < n_reads; ++r)
+      for (size_t i = cnt[r]; i < off[r + 1] - off[r]; ++i)
+        state[off[r] + i] = KM_AMBIG;
+
+    // Phase 2: look up pending k-mers, one database at a time
+    for (size_t d = 0; d < n_dbs; ++d) {
+      for (int t = 0; t < n_threads; ++t)
+        local[t].clear();
+      #ifdef _OPENMP
+      #pragma omp parallel
+      #endif
+      {
+        #ifdef _OPENMP
+        vector<BatchQuery> &mine = local[omp_get_thread_num()];
+        #pragma omp for schedule(static)
+        #else
+        vector<BatchQuery> &mine = local[0];
+        #endif
+        for (size_t i = 0; i < total; ++i) {
+          if (state[i] == KM_PENDING) {
+            BatchQuery q;
+            q.kmer = kmers[i];
+            q.idx = i;
+            q.bin = KrakenDatabases[d]->bin_of(q.kmer);
+            mine.push_back(q);
+          }
+        }
+      }
+      size_t n_q = 0;
+      vector<size_t> starts(n_threads);
+      for (int t = 0; t < n_threads; ++t) {
+        starts[t] = n_q;
+        n_q += local[t].size();
+      }
+      if (n_q == 0)
+        break;
+      qs.resize(n_q);
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(static, 1)
+      #endif
+      for (int t = 0; t < n_threads; ++t)
+        std::copy(local[t].begin(), local[t].end(), qs.begin() + starts[t]);
+
+      // KRAKEN_BATCH_FORCE_HINTS (testing): take the out-of-cache path even if DBs are resident
+      const bool hints = Page_hints &&
+          (getenv("KRAKEN_BATCH_FORCE_HINTS") != NULL ||
+           resident_fraction(Db_maps[d].first, Db_maps[d].second) < 0.98 ||
+           resident_fraction(Idx_maps[d].first, Idx_maps[d].second) < 0.98);
+      // Sorting only pays off when the DB has to be paged in; for resident DBs
+      // the prefetching in lookup_sorted_queries() is enough
+      if (hints) {
+        #if defined(_OPENMP) && defined(__GLIBCXX__)
+        __gnu_parallel::sort(qs.begin(), qs.end(), batch_query_less);
+        #else
+        std::sort(qs.begin(), qs.end(), batch_query_less);
+        #endif
+      }
+      lookup_sorted_queries(d, qs, taxa, state, hints);
+    }
+
+    // Phase 3: per-read classification, output in input order
+    const size_t n_slices = unit_start.size() - 1;
+    vector<ostringstream> kos(n_slices), cos_(n_slices), uos(n_slices);
+    uint64_t batch_classified = 0;
+
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+      uint64_t my_classified = 0;
+      vector<uint32_t> read_taxa;
+      vector<char> ambig_list;
+      unordered_map<uint32_t, uint32_t> hit_counts;
+
+      #ifdef _OPENMP
+      #pragma omp for schedule(dynamic)
+      #endif
+      for (size_t s = 0; s < n_slices; ++s) {
+        unordered_map<uint32_t, READCOUNTS> unit_counts;
+        for (size_t r = unit_start[s]; r < unit_start[s + 1]; ++r) {
+          read_taxa.clear();
+          ambig_list.clear();
+          hit_counts.clear();
+          uint32_t taxon = 0;
+          for (size_t i = 0; i < cnt[r]; ++i) {
+            const size_t x = off[r] + i;
+            taxon = 0;
+            if (state[x] == KM_AMBIG) {
+              ambig_list.push_back(1);
+            } else {
+              ambig_list.push_back(0);
+              taxon = taxa[x];
+              unit_counts[taxon].add_kmer(kmers[x]);
+              if (taxon)
+                hit_counts[taxon]++;
+            }
+            read_taxa.push_back(taxon);
+          }
+          my_classified += finish_classification(reads[r], read_taxa, ambig_list, hit_counts,
+                                                 0, taxon, kos[s], cos_[s], uos[s],
+                                                 unit_counts);
+        }
+        #ifdef _OPENMP
+        #pragma omp critical(write_output)
+        #endif
+        {
+          for (auto it = unit_counts.begin(); it != unit_counts.end(); ++it)
+            taxon_counts[it->first] += std::move(it->second);
+        }
+      }
+
+      #ifdef _OPENMP
+      #pragma omp atomic
+      #endif
+      batch_classified += my_classified;
+    }
+
+    for (size_t s = 0; s < n_slices; ++s) {
+      if (Print_kraken)
+        (*Kraken_output) << kos[s].str();
+      if (Print_classified)
+        (*Classified_output) << cos_[s].str();
+      if (Print_unclassified)
+        (*Unclassified_output) << uos[s].str();
+    }
+    total_classified += batch_classified;
+    total_sequences += n_reads;
+    total_bases += batch_nt;
+    if (Print_Progress)
+      fprintf(stderr, "\r Processed %llu sequences (%.2f%% classified)",
+              total_sequences, total_classified * 100.0 / total_sequences);
+  }
 
   delete reader;
 }
@@ -949,6 +1320,17 @@ bool classify_sequence(DNASequence &dna, ostringstream &koss,
     }
   }
 
+  return finish_classification(dna, taxa, ambig_list, hit_counts, hits, taxon,
+                               koss, coss, uoss, my_taxon_counts);
+}
+
+// Everything that follows the k-mer lookups: calls the read and writes output
+bool finish_classification(DNASequence &dna, const vector<uint32_t> &taxa,
+                           const vector<char> &ambig_list,
+                           unordered_map<uint32_t, uint32_t> &hit_counts,
+                           uint32_t hits, uint32_t taxon, ostringstream &koss,
+                           ostringstream &coss, ostringstream &uoss,
+                           unordered_map<uint32_t, READCOUNTS>& my_taxon_counts) {
   uint32_t call = 0;
   if (Map_UIDs) {
     if (Quick_mode) {
@@ -1071,7 +1453,7 @@ void parse_command_line(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "-h") == 0)
     usage(0);
-  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qcC:U:Ma:r:sI:p:x:")) != -1) {
+  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qcC:U:Ma:r:sI:p:x:B:H")) != -1) {
     switch (opt) {
       case 'd' :
         DB_filenames.push_back(optarg);
@@ -1138,6 +1520,23 @@ void parse_command_line(int argc, char **argv) {
         Populate_memory = true;
         Populate_memory_size = parse_human_readable_size(optarg); // strtoull(optarg, NULL, 0);
         break;
+      case 'B' :
+        {
+        const string size_arg(optarg);
+        const size_t digits = size_arg.find_first_not_of("0123456789");
+        if (size_arg.empty() || digits == 0 ||
+            (digits != string::npos &&
+             (digits + 1 != size_arg.size() ||
+              string("kKmMgG").find(size_arg[digits]) == string::npos)))
+          errx(EX_USAGE, "invalid batch size: %s", optarg);
+        Batch_size = parse_human_readable_size(optarg);
+        if (!Batch_size && size_arg.find_first_of("123456789") != string::npos)
+          errx(EX_USAGE, "invalid or overflowing batch size: %s", optarg);
+        }
+        break;
+      case 'H' :
+        Page_hints = false;
+        break;
       case 'I' :
         UID_to_TaxID_map_filename = optarg;
         Map_UIDs = true;
@@ -1181,6 +1580,8 @@ void usage(int exit_code) {
        << "  -c               Only include classified reads in output" << endl
        << "  -M               Preload database files" << endl
        << "  -x size          Preload database files using x amount of RAM (e.g. 10G)" << endl
+       << "  -B size          Look up k-mers in batches of reads totalling this many bp (default 16M, 0 = read by read)" << endl
+       << "  -H               Don't sort k-mers and issue paging hints for out-of-cache databases (batch mode)" << endl
        << "  -s               Print read sequence in Kraken output" << endl
        << "  -h               Print this message" << endl
        << endl
