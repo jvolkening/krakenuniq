@@ -70,6 +70,7 @@ my $report_file;
 my $print_sequence = 0;
 my $uid_mapping = 0;
 my $hll_precision = 12;
+my $batch_size = '16M';
 my $use_exact_counting = 0;
 my @cmdline = @ARGV;
 
@@ -91,6 +92,7 @@ GetOptions(
   "preload-size=s" => \$preload_size,
   "paired" => \$paired,
   "hll-precision=i", \$hll_precision,
+  "batch-size=s", \$batch_size,
   "exact", \$use_exact_counting,
   "check-names" => \$check_names,
   "gzip-compressed" => \$gunzip,
@@ -199,6 +201,7 @@ push @flags, "-r", $report_file if defined $report_file;
 push @flags, "-a", $db_prefix[0]."/taxDB";
 push @flags, "-s" if $print_sequence;
 push @flags, "-p", $hll_precision;
+push @flags, "-B", $batch_size;
 if ($uid_mapping) {
   my $uid_mapping_file = "$db_prefix[0]/uid_to_taxid.map";
   if (!-f $uid_mapping_file) {
@@ -278,6 +281,7 @@ Options:
                           Print no Kraken output for unclassified sequences
   --preload               Loads the entire DB into memory before classification
   --preload-size SIZE     Loads DB into memory in chunks of SIZE, e.g. 500M or 7G (if RAM is small), overrides --preload flag.  Can only be used with a single input database.
+  --batch-size SIZE       Loads query into memory in chunks of SIZE, e.g. 10M or 1G (default: 16M); a value of 0 disables feature (classic behavior)
   --paired                The two filenames provided are paired-end reads
   --check-names           Ensure each pair of reads have names that agree
                           with each other; ignored if --paired is not specified
