@@ -20,7 +20,7 @@ PROGS1 = classify classifyExact db_sort compact_db set_lcas db_shrink build_taxd
 TEST_PROGS = grade_classification test_hll_on_db dump_db_kmers
 #PROGS = $(PROGS1) $(TEST_PROGS)
 PROGS = $(PROGS1)
-LIBFLAGS = -L. -lz -lbz2 ${LDFLAGS}
+LIBFLAGS = -L. -lz -lbz2
 
 .PHONY: all install clean
 
@@ -41,14 +41,14 @@ db_sort: krakendb.o quickfile.o
 compact_db: krakendb.o quickfile.o
 
 set_lcas: set_lcas.cpp krakendb.o quickfile.o krakenutil.o seqreader.o uid_mapping.o
-	$(CXX) $(CXXFLAGS) -o set_lcas $^ $(LIBFLAGS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o set_lcas $^ $(LIBFLAGS)
 
 grade_classification: #taxdb.hpp report-cols.hpp
 
 read_uid_mapping: quickfile.o
 
 count_unique: count_unique.cpp hyperloglogplus.o seqreader.o krakenutil.o
-	$(CXX) $(CXXFLAGS) -o count_unique $^ $(LIBFLAGS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o count_unique $^ $(LIBFLAGS)
 
 test_count_unique: hyperloglogplus.o 
 
@@ -57,10 +57,10 @@ test_hll_on_db: krakendb.o hyperloglogplus.o quickfile.o
 dump_db_kmers: krakendb.o quickfile.o
 
 classify: classify.cpp krakendb.o quickfile.o krakenutil.o seqreader.o uid_mapping.o gzstream.o hyperloglogplus.o
-	$(CXX) $(CXXFLAGS) -o classify $^ $(LIBFLAGS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o classify $^ $(LIBFLAGS)
 
 classifyExact: classify.cpp krakendb.o quickfile.o krakenutil.o seqreader.o uid_mapping.o gzstream.o hyperloglogplus.o
-	$(CXX) $(CXXFLAGS) -DEXACT_COUNTING -o classifyExact $^ $(LIBFLAGS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -DEXACT_COUNTING -o classifyExact $^ $(LIBFLAGS)
 
 query_taxdb: #taxdb.hpp
 

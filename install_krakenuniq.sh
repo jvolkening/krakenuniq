@@ -21,9 +21,10 @@ set -e
 DIR=$(dirname $0)
 VERSION=`cat $(dirname $0)/VERSION`
 INSTALL_JELLYFISH=1
-MAKE_ARGS=
+MAKE_ARGS=()
 MAKE_CLEAN="clean"
 ADD_DEBUG_INFO=0
+STATIC_LINK=0
 LINK_DIR=
 
 USAGE="Usage: $(basename $0) [OPTIONS] INSTALL_DIR
@@ -32,6 +33,7 @@ OPTIONS:
     -l BIN_DIR  Link KrakenUniq executables to BIN_DIR, e.g /usr/local/bin or ~/bin.
     -s          Skip building the bundled Jellyfish fork (installed as 'krakenfish').
     -c BIN      Use compiler BIN instead of g++.
+    -S          Statically link compiled executables (requires static system libraries).
     -g          Add debug info
     -h          This help message
 
@@ -39,12 +41,13 @@ On MacOS, if you experience the error \"clang: fatal error: unsupported option '
 "
 
 
-while getopts "Chsc:gl:" OPTION; do
+while getopts "ChsSc:gl:" OPTION; do
     case $OPTION in
-    c) MAKE_ARGS="CXX=\"$OPTARG\"" ;;
+    c) MAKE_ARGS+=("CXX=$OPTARG") ;;
     C) MAKE_CLEAN="" ;;
     g) ADD_DEBUG_INFO=1 ;;
     s) INSTALL_JELLYFISH=0 ;;
+    S) STATIC_LINK=1 ;;
     l) LINK_DIR="$OPTARG" ;;
     h) echo "$USAGE"; exit 0 ;;
     *) echo "Incorrect options provided. $USAGE"
@@ -73,27 +76,45 @@ export KRAKEN_DIR=$(perl -MCwd=abs_path -le 'print abs_path(shift)' "$1")
 
 mkdir -p "$KRAKEN_DIR"
 if [ "$INSTALL_JELLYFISH" == "1" ]; then
-  if [ ! -x "$KRAKEN_DIR/krakenfish" ]; then
+  if [[ ! -x "$KRAKEN_DIR/krakenfish" || "$STATIC_LINK" == 1 ]]; then
     echo "Installing krakenfish (bundled Jellyfish fork)"
     JF_SRC=$(perl -MCwd=abs_path -le 'print abs_path(shift)' "$DIR/external/jellyfish")
     JF_BUILD=$(mktemp -d)
     JF_PREFIX="$JF_BUILD/prefix"
+    JF_CONFIGURE_ARGS=()
+    JF_LDFLAGS=${LDFLAGS:-}
+    if [[ "$STATIC_LINK" == 1 ]]; then
+      JF_CONFIGURE_ARGS+=(--enable-all-static)
+      JF_LDFLAGS="-static${JF_LDFLAGS:+ $JF_LDFLAGS}"
+    fi
     cp -a "$JF_SRC/." "$JF_BUILD/src" && rm -rf "$JF_BUILD/src/autom4te.cache"
     (cd "$JF_BUILD/src" \
       && { [ -x ./configure ] || autoreconf -i; } \
-      && ./configure --prefix="$JF_PREFIX" --disable-shared CXXFLAGS="-O2 -std=gnu++11 -Wno-error" --program-transform-name='s/^jellyfish$/krakenfish/' \
+      && LDFLAGS="$JF_LDFLAGS" ./configure --prefix="$JF_PREFIX" --disable-shared "${JF_CONFIGURE_ARGS[@]}" CXXFLAGS="-O2 -std=gnu++11 -Wno-error" --program-transform-name='s/^jellyfish$/krakenfish/' \
       && make -j && make install \
-      && if [ -x "$JF_PREFIX/bin/krakenfish" ]; then cp "$JF_PREFIX/bin/krakenfish" "$KRAKEN_DIR/krakenfish";
-         else cp "$JF_PREFIX/bin/jellyfish" "$KRAKEN_DIR/krakenfish"; fi \
-      && chmod +x "$KRAKEN_DIR/krakenfish") \
-      || echo "krakenfish installation failed, building new database may not work properly"
+      && { if [ -x "$JF_PREFIX/bin/krakenfish" ]; then cp "$JF_PREFIX/bin/krakenfish" "$KRAKEN_DIR/krakenfish";
+           else cp "$JF_PREFIX/bin/jellyfish" "$KRAKEN_DIR/krakenfish"; fi; } \
+      && chmod +x "$KRAKEN_DIR/krakenfish"
+    ) || {
+      rm -rf "$JF_BUILD"
+      if [[ "$STATIC_LINK" == 1 ]]; then
+        echo "Static krakenfish build failed; check that static system libraries are installed." >&2
+        exit 1
+      fi
+      echo "krakenfish installation failed, building new database may not work properly"
+    }
     rm -rf "$JF_BUILD"
   fi
 fi
 
-[[ "$ADD_DEBUG_INFO" == 1 ]] && MAKE_ARGS="$MAKE_ARGS NDEBUG=-g"
-echo make -C $DIR/src $MAKE_CLEAN install $MAKE_ARGS
-make -C $DIR/src $MAKE_CLEAN  install $MAKE_ARGS || { echo "Error building KrakenUniq. See $(basename $0) -h for options." >&2; exit 1; }
+[[ "$ADD_DEBUG_INFO" == 1 ]] && MAKE_ARGS+=("NDEBUG=-g")
+if [[ "$STATIC_LINK" == 1 ]]; then
+  MAKE_ARGS+=("LDFLAGS=-static${LDFLAGS:+ $LDFLAGS}")
+fi
+MAKE_GOALS=(install)
+[[ -n "$MAKE_CLEAN" ]] && MAKE_GOALS=(clean install)
+echo make -C "$DIR/src" "${MAKE_GOALS[@]}" "${MAKE_ARGS[@]}"
+make -C "$DIR/src" "${MAKE_GOALS[@]}" "${MAKE_ARGS[@]}" || { echo "Error building KrakenUniq. See $(basename "$0") -h for options." >&2; exit 1; }
 for file in $DIR/scripts/*
 do
   [[ -f $file ]] || continue;
