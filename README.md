@@ -13,6 +13,9 @@ We now have two standard Kraken1/KrakenUniq databases available for free downloa
 
 # Announcements
 
+## New release v1.3.1
+This release fixes a bug in `krakenuniq-report` related to a configuration parameter added in v1.1.0 and restores its default behavior to that of earlier versions.
+
 ## New release v1.3.0
 This release introduces batch processing of the input reads when performing a hierarchical search on multiple databases with `classify`. In cases where all databases do not fit into memory at the same time, this feature should significantly speed up searches due to reduced traversals of the databases and consequently reduced major page faults. The batch size is configurable (16M default) via `--batch-size` in `krakenuniq` or `-B` in `classify`, and batching can be disabled by setting this value to `0`.
 

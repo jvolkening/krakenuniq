@@ -42,7 +42,7 @@ my $show_zeros = 0;
 my $db_prefix;
 my $is_cnts_table = 0;
 my $is_taxon_list = 0;
-my $abund_sigfigs = 0;
+my $abund_sigfigs;
 
 GetOptions(
   "help" => \&display_help,
@@ -138,7 +138,7 @@ for (keys %name_map) {
 }
 
 my $abund_fmt = defined $abund_sigfigs
-    ? "%0.{$abund_sigfigs}g"
+    ? "%0.${abund_sigfigs}g"
     : "%6.2f";
 printf "$abund_fmt\t%d\t%d\t%s\t%d\t%s%s\n",
   $clade_counts{0} * 100 / $seq_count,
