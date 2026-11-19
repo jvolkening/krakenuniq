@@ -602,13 +602,15 @@ void process_file(char *filename) {
 
 namespace {
 
+template <typename Bin>
 struct BatchQuery {
-  uint64_t bin;
   uint64_t kmer;
+  Bin bin;
   uint32_t idx;   // position in the batch's flat k-mer array
 };
 
-inline bool batch_query_less(const BatchQuery &a, const BatchQuery &b) {
+template <typename Bin>
+inline bool batch_query_less(const BatchQuery<Bin> &a, const BatchQuery<Bin> &b) {
   return a.bin != b.bin ? a.bin < b.bin : a.kmer < b.kmer;
 }
 
@@ -654,7 +656,8 @@ inline void hint_range(const char *lo, const char *hi, const char **last_end) {
   *last_end = (const char *) b;
 }
 
-void lookup_sorted_queries(size_t db_id, const std::vector<BatchQuery> &qs,
+template <typename Bin>
+void lookup_sorted_queries(size_t db_id, const std::vector<BatchQuery<Bin> > &qs,
                            std::vector<uint32_t> &taxa, std::vector<uint8_t> &state,
                            bool hints) {
   KrakenDB *db = KrakenDatabases[db_id];
@@ -691,7 +694,7 @@ void lookup_sorted_queries(size_t db_id, const std::vector<BatchQuery> &qs,
         __builtin_prefetch(hi > lo ? hi - 1 : hi);
       }
 
-      const BatchQuery &q = qs[j];
+      const BatchQuery<Bin> &q = qs[j];
       uint32_t taxon;
       bool found;
       if (j > a && q.kmer == prev_kmer) {
@@ -711,6 +714,76 @@ void lookup_sorted_queries(size_t db_id, const std::vector<BatchQuery> &qs,
       }
     }
   }
+}
+
+template <typename Bin>
+bool lookup_batch_database(size_t db_id, const vector<uint64_t> &kmers,
+                           vector<uint32_t> &taxa, vector<uint8_t> &state,
+                           vector<BatchQuery<Bin> > &qs, int max_threads) {
+  const size_t total = kmers.size();
+  vector<size_t> starts(max_threads);
+  size_t n_q = 0;
+  KrakenDB *db = KrakenDatabases[db_id];
+
+  // Count first, then fill disjoint portions of one query vector. This avoids
+  // retaining a second, thread-local copy of every pending query.
+  #ifdef _OPENMP
+  #pragma omp parallel
+  #endif
+  {
+    #ifdef _OPENMP
+    const size_t thread = omp_get_thread_num();
+    const size_t threads = omp_get_num_threads();
+    #else
+    const size_t thread = 0, threads = 1;
+    #endif
+    const size_t begin = (total / threads) * thread + min(thread, total % threads);
+    const size_t end = begin + total / threads + (thread < total % threads);
+    size_t count = 0;
+    for (size_t i = begin; i < end; ++i)
+      count += state[i] == KM_PENDING;
+    starts[thread] = count;
+
+    #ifdef _OPENMP
+    #pragma omp barrier
+    #pragma omp single
+    #endif
+    {
+      for (size_t t = 0; t < threads; ++t) {
+        size_t count = starts[t];
+        starts[t] = n_q;
+        n_q += count;
+      }
+      qs.resize(n_q);
+    }
+
+    size_t dest = starts[thread];
+    for (size_t i = begin; i < end; ++i) {
+      if (state[i] == KM_PENDING) {
+        BatchQuery<Bin> &q = qs[dest++];
+        q.kmer = kmers[i];
+        q.idx = i;
+        q.bin = db->bin_of(q.kmer);
+      }
+    }
+  }
+  if (n_q == 0)
+    return false;
+
+  // KRAKEN_BATCH_FORCE_HINTS (testing): take the out-of-cache path even if DBs are resident
+  const bool hints = Page_hints &&
+      (getenv("KRAKEN_BATCH_FORCE_HINTS") != NULL ||
+       resident_fraction(Db_maps[db_id].first, Db_maps[db_id].second) < 0.98 ||
+       resident_fraction(Idx_maps[db_id].first, Idx_maps[db_id].second) < 0.98);
+  if (hints) {
+    #if defined(_OPENMP) && defined(__GLIBCXX__)
+    __gnu_parallel::sort(qs.begin(), qs.end(), batch_query_less<Bin>);
+    #else
+    std::sort(qs.begin(), qs.end(), batch_query_less<Bin>);
+    #endif
+  }
+  lookup_sorted_queries(db_id, qs, taxa, state, hints);
+  return true;
 }
 
 } // namespace
@@ -738,8 +811,8 @@ void process_file_batched(char *filename) {
   #else
   const int n_threads = 1;
   #endif
-  vector<BatchQuery> qs;
-  vector<vector<BatchQuery> > local(n_threads);  // kept across batches to avoid page-faulting fresh memory
+  vector<BatchQuery<uint32_t> > qs;
+  vector<BatchQuery<uint64_t> > wide_qs;
 
   while (reader->is_valid()) {
     reads.clear();
@@ -804,58 +877,16 @@ void process_file_batched(char *filename) {
 
     // Phase 2: look up pending k-mers, one database at a time
     for (size_t d = 0; d < n_dbs; ++d) {
-      for (int t = 0; t < n_threads; ++t)
-        local[t].clear();
-      #ifdef _OPENMP
-      #pragma omp parallel
-      #endif
-      {
-        #ifdef _OPENMP
-        vector<BatchQuery> &mine = local[omp_get_thread_num()];
-        #pragma omp for schedule(static)
-        #else
-        vector<BatchQuery> &mine = local[0];
-        #endif
-        for (size_t i = 0; i < total; ++i) {
-          if (state[i] == KM_PENDING) {
-            BatchQuery q;
-            q.kmer = kmers[i];
-            q.idx = i;
-            q.bin = KrakenDatabases[d]->bin_of(q.kmer);
-            mine.push_back(q);
-          }
-        }
+      bool pending;
+      if (KrakenDatabases[d]->get_index()->indexed_nt() <= 16) {
+        vector<BatchQuery<uint64_t> >().swap(wide_qs);
+        pending = lookup_batch_database(d, kmers, taxa, state, qs, n_threads);
+      } else {
+        vector<BatchQuery<uint32_t> >().swap(qs);
+        pending = lookup_batch_database(d, kmers, taxa, state, wide_qs, n_threads);
       }
-      size_t n_q = 0;
-      vector<size_t> starts(n_threads);
-      for (int t = 0; t < n_threads; ++t) {
-        starts[t] = n_q;
-        n_q += local[t].size();
-      }
-      if (n_q == 0)
+      if (!pending)
         break;
-      qs.resize(n_q);
-      #ifdef _OPENMP
-      #pragma omp parallel for schedule(static, 1)
-      #endif
-      for (int t = 0; t < n_threads; ++t)
-        std::copy(local[t].begin(), local[t].end(), qs.begin() + starts[t]);
-
-      // KRAKEN_BATCH_FORCE_HINTS (testing): take the out-of-cache path even if DBs are resident
-      const bool hints = Page_hints &&
-          (getenv("KRAKEN_BATCH_FORCE_HINTS") != NULL ||
-           resident_fraction(Db_maps[d].first, Db_maps[d].second) < 0.98 ||
-           resident_fraction(Idx_maps[d].first, Idx_maps[d].second) < 0.98);
-      // Sorting only pays off when the DB has to be paged in; for resident DBs
-      // the prefetching in lookup_sorted_queries() is enough
-      if (hints) {
-        #if defined(_OPENMP) && defined(__GLIBCXX__)
-        __gnu_parallel::sort(qs.begin(), qs.end(), batch_query_less);
-        #else
-        std::sort(qs.begin(), qs.end(), batch_query_less);
-        #endif
-      }
-      lookup_sorted_queries(d, qs, taxa, state, hints);
     }
 
     // Phase 3: per-read classification, output in input order

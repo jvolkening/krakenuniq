@@ -47,8 +47,10 @@ For normal classification, `classify` batches reads and searches one database at
 a time, preserving first-database priority for each k-mer. This can reduce
 disk paging when the databases together exceed available memory. Batching uses
 additional memory for reads and k-mers; its default target is 16,000,000 bases,
-rounded up to a whole work unit. When invoking `classify` directly, use
-`-B SIZE` to change the target (for example, `-B 4M`), or `-B 0` to use
+rounded up to a whole work unit. For compact databases, the query buffer uses
+16 bytes per pending k-mer on typical 64-bit systems; reads, other k-mer arrays,
+sorting, and retained buffer capacity require additional memory. When invoking
+`classify` directly, use `-B SIZE` to change the target (for example, `-B 4M`), or `-B 0` to use
 the original per-read lookup. The `K`, `M`, and `G` suffixes are binary.
 `-H` disables sorting and explicit paging hints, but retains batching and
 CPU cache prefetching. Quick mode (`-q`) and chunked preloading (`-x`) use

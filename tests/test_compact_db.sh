@@ -3,6 +3,8 @@
 # checks that compact_db's verification passes and that classify gives
 # identical results (also in chunked mode) for both formats.
 # Usage: tests/test_compact_db.sh   (after 'make' in src/)
+# KRAKEN_TEST_WIDE_INDEX=1 also tests a legacy 17-nt index, using a sparse
+# 128 GiB file and mapping that much virtual address space.
 
 set -eu
 SRC=$(cd "$(dirname "$0")/../src" && pwd)
@@ -45,9 +47,14 @@ with open(sys.argv[1], 'r+b') as f:
 PYEOF
     cp "$D/reads.fa" "$D/batch.fa"
     printf '>short\nACGT\n>ambiguous\nNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN\n' >> "$D/batch.fa"
+    awk 'NR == 2 {for (i = 0; i < 30; i++) print ">duplicate" i "\n" $0; exit}' \
+      "$D/reads.fa" >> "$D/batch.fa"
     awk 'NR % 2 {id=substr($0,2); next} {print "@" id "\n" $0 "\n+"; gsub(/./,"I"); print}' \
       "$D/batch.fa" > "$D/batch.fq"
-    for input in "$D/batch.fa" "$D/batch.fq"; do
+    printf '>short\nACGT\n>ambiguous\nNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN\n' > "$D/no-pending.fa"
+    threads=(1)
+    if [ "$(nproc)" -ge 2 ]; then threads+=(2); fi
+    for input in "$D/batch.fa" "$D/batch.fq" "$D/no-pending.fa"; do
       for order in plain compact; do
         if [ "$order" = plain ]; then
           db1="$D/db.kdb"; idx1="$D/db.idx"
@@ -60,14 +67,23 @@ PYEOF
                 -d "$D/conflict.kdb" -i "$D/db.idx" -a "$D/taxDB" -t 1 -u 5000)
         "$SRC/classify" "${common[@]}" -B 0 -o "$D/baseline.out" -r "$D/baseline.report" \
           -C "$D/baseline.classified" -U "$D/baseline.unclassified" "$input" 2>/dev/null
-        KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" "${common[@]}" -B 6000 \
-          -o "$D/batch.out" -r "$D/batch.report" -C "$D/batch.classified" \
-          -U "$D/batch.unclassified" "$input" 2>/dev/null
-        cmp "$D/baseline.out" "$D/batch.out"
-        cmp "$D/baseline.report" "$D/batch.report"
-        cmp "$D/baseline.classified" "$D/batch.classified"
-        cmp "$D/baseline.unclassified" "$D/batch.unclassified"
-        rm "$D/baseline.report" "$D/batch.report"
+        for t in "${threads[@]}"; do
+          for size in 6000 1M; do
+            for mode in sorted unsorted; do
+              hint=()
+              if [ "$mode" = unsorted ]; then hint=(-H); fi
+              KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" "${common[@]}" -t "$t" -B "$size" \
+                "${hint[@]}" -o "$D/batch.out" -r "$D/batch.report" -C "$D/batch.classified" \
+                -U "$D/batch.unclassified" "$input" 2>/dev/null
+              cmp "$D/baseline.out" "$D/batch.out"
+              cmp "$D/baseline.report" "$D/batch.report"
+              cmp "$D/baseline.classified" "$D/batch.classified"
+              cmp "$D/baseline.unclassified" "$D/batch.unclassified"
+              rm "$D/batch.report"
+            done
+          done
+        done
+        rm "$D/baseline.report"
       done
     done
     if "$SRC/classify" -B nonsense 2>"$D/invalid.err"; then
@@ -75,6 +91,53 @@ PYEOF
     fi
     grep -q "invalid batch size" "$D/invalid.err"
     echo "hierarchical batch output matches the per-read path"
+    if [ "${KRAKEN_TEST_WIDE_INDEX:-0}" = 1 ]; then
+      # Only the queried offsets need physical storage in this sparse fixture.
+      python3 - "$D" <<'PYEOF'
+import random, struct, sys
+from pathlib import Path
+d = Path(sys.argv[1])
+k, nt = 31, 17
+mask = (1 << (2 * nt)) - 1
+xor = 0xe37e28c4271b5a2d & mask
+rng = random.Random(391)
+def revcomp(n, length):
+    result = 0
+    for _ in range(length):
+        result = (result << 2) | (3 - (n & 3))
+        n >>= 2
+    return result
+while True:
+    key = rng.getrandbits(2 * k)
+    key = min(key, revcomp(key, k))
+    windows = [(key >> (2 * i)) & mask for i in range(k - nt + 1)]
+    bin_key = min(min(w, revcomp(w, nt)) ^ xor for w in windows)
+    if bin_key > (1 << 32):
+        break
+header_size = 72 + 2 * (4 + 8 * 2 * k)
+header = bytearray((d / "db.kdb").read_bytes()[:header_size])
+struct.pack_into("<Q", header, 48, 1)
+(d / "wide.kdb").write_bytes(header + struct.pack("<QI", key, 100))
+with open(d / "wide.idx", "wb") as f:
+    f.write(b"KRAKIX2" + bytes([nt]))
+    f.truncate(8 + 8 * ((1 << (2 * nt)) + 1))
+    f.seek(8 + 8 * (bin_key + 1))
+    f.write(struct.pack("<Q", 1))
+seq = "".join("ACGT"[(key >> (2 * i)) & 3] for i in reversed(range(k)))
+(d / "wide.fa").write_text("".join(f">wide{i}\n{seq}\n" for i in range(100)) + ">ambig\n" + "N" * k + "\n")
+(d / "wide.expected").write_text("".join(f"C\twide{i}\t100\t31\t100:1\n" for i in range(100)) + "U\tambig\t0\t31\tA:1\n")
+PYEOF
+      for mode in sorted unsorted; do
+        hint=()
+        if [ "$mode" = unsorted ]; then hint=(-H); fi
+        KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" -d "$D/db.kdbc" -i "$D/db.idxc" \
+          -d "$D/wide.kdb" -i "$D/wide.idx" -d "$D/db.kdbc" -i "$D/db.idxc" \
+          -a "$D/taxDB" -t "${threads[-1]}" -B 1M "${hint[@]}" -r off \
+          -o "$D/wide.out" "$D/wide.fa" 2>/dev/null
+        cmp "$D/wide.expected" "$D/wide.out"
+      done
+      echo "wide legacy index and mixed-width databases match expected output"
+    fi
   fi
   # chunked mode, small chunks (forces several chunks)
   local CH=$(( $(stat -c %s "$D/db.kdbc") / 5 ))
