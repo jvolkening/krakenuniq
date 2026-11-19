@@ -221,8 +221,12 @@ if (! -f $db_prefix[0]."/taxDB") {
   my $cmd = "$CREATE_TAXDB $db_prefix[0]/taxonomy/names.dmp $db_prefix[0]/taxonomy/nodes.dmp > $db_prefix[0]/taxDB";
   print STDERR "$cmd\n";
   my $ret = system $cmd;
-  die "Error running $CREATE_TAXDB: $!\n"
-    if ($ret);
+  my $exit_code = $? >> 8;
+  if ($ret) {
+    unlink "$db_prefix[0]/taxDB"
+        if (-e "$db_prefix[0]/taxDB");
+    die "$CREATE_TAXDB exited with error code $exit_code: $!\n";
+  }
 }
 
 my $DIR="./";
@@ -238,8 +242,12 @@ if ($paired) {
   $cmd.=join(" ",@ARGV);
   $cmd.=" 1>$DIR/$random_prefix.merged.fa 2>$DIR/$random_prefix.merged.err";
   my $ret = system($cmd);
-  die "Error running $READ_MERGER: $!\n"
-    if ($ret);
+  my $exit_code = $? >> 8;
+  if ($ret) {
+    unlink "$DIR/$random_prefix.merged.fa"
+      if (-e "$DIR/$random_prefix.merged.fa");
+    die "$READ_MERGER exited with error code $exit_code: $!\n";
+  }
   @ARGV=();
   push(@ARGV,"$DIR/$random_prefix.merged.fa");
 }
@@ -253,8 +261,10 @@ if (defined $report_file) {
     close($RF)
 }
 my $ret = system("$cmd @flags @ARGV");
-die "Error running $cmd: $!\n"
-    if ($ret);
+my $exit_code = $? >> 8;
+if ($ret) {
+  die "$cmd exited with error code $exit_code: $!\n";
+}
 #die "$PROG: exec error: $!\n";
 if ($paired) {
   unlink("$DIR/$random_prefix.merged.fa");
