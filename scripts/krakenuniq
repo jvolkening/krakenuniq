@@ -220,7 +220,9 @@ if (! -f $db_prefix[0]."/taxDB") {
 
   my $cmd = "$CREATE_TAXDB $db_prefix[0]/taxonomy/names.dmp $db_prefix[0]/taxonomy/nodes.dmp > $db_prefix[0]/taxDB";
   print STDERR "$cmd\n";
-  system $cmd;
+  my $ret = system $cmd;
+  die "Error running $CREATE_TAXDB: $!\n"
+    if ($ret);
 }
 
 my $DIR="./";
@@ -235,7 +237,9 @@ if ($paired) {
   $cmd.=" --check-names " if $check_names;
   $cmd.=join(" ",@ARGV);
   $cmd.=" 1>$DIR/$random_prefix.merged.fa 2>$DIR/$random_prefix.merged.err";
-  system($cmd);
+  my $ret = system($cmd);
+  die "Error running $READ_MERGER: $!\n"
+    if ($ret);
   @ARGV=();
   push(@ARGV,"$DIR/$random_prefix.merged.fa");
 }
@@ -248,7 +252,9 @@ if (defined $report_file) {
     print $RF "# KrakenUniq v#####=VERSION=##### DATE:$date DB:@db_prefix DB_SIZE:$db_size WD:$wd\n# CL:$mycmd\n";
     close($RF)
 }
-system("$cmd @flags @ARGV");
+my $ret = system("$cmd @flags @ARGV");
+die "Error running $cmd: $!\n"
+    if ($ret);
 #die "$PROG: exec error: $!\n";
 if ($paired) {
   unlink("$DIR/$random_prefix.merged.fa");

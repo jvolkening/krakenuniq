@@ -13,6 +13,9 @@ We now have two standard Kraken1/KrakenUniq databases available for free downloa
 
 # Announcements
 
+## New release v1.3.2
+This release fixes a longstanding bug in `krakenuniq` where the return value of system() calls is not checked, so failures in the underlying processes are not propagated to the user.
+
 ## New release v1.3.1
 This release fixes a bug in `krakenuniq-report` related to a configuration parameter added in v1.1.0 and restores its default behavior to that of earlier versions.
 
