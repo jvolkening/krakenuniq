@@ -72,20 +72,116 @@ PYEOF
             for mode in sorted unsorted; do
               hint=()
               if [ "$mode" = unsorted ]; then hint=(-H); fi
-              KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" "${common[@]}" -t "$t" -B "$size" \
-                "${hint[@]}" -o "$D/batch.out" -r "$D/batch.report" -C "$D/batch.classified" \
-                -U "$D/batch.unclassified" "$input" 2>/dev/null
-              cmp "$D/baseline.out" "$D/batch.out"
-              cmp "$D/baseline.report" "$D/batch.report"
-              cmp "$D/baseline.classified" "$D/batch.classified"
-              cmp "$D/baseline.unclassified" "$D/batch.unclassified"
-              rm "$D/batch.report"
+              for strategy in batched outer; do
+                outer=()
+                if [ "$strategy" = outer ]; then outer=(-D); fi
+                KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" "${common[@]}" -t "$t" -B "$size" \
+                  "${hint[@]}" "${outer[@]}" -o "$D/batch.out" -r "$D/batch.report" \
+                  -C "$D/batch.classified" -U "$D/batch.unclassified" "$input" 2>/dev/null
+                cmp "$D/baseline.out" "$D/batch.out"
+                cmp "$D/baseline.report" "$D/batch.report"
+                cmp "$D/baseline.classified" "$D/batch.classified"
+                cmp "$D/baseline.unclassified" "$D/batch.unclassified"
+                rm "$D/batch.report"
+              done
             done
           done
         done
         rm "$D/baseline.report"
       done
     done
+    # First database has no keys, so later databases must resolve queries.
+    python3 - "$D" <<'PYEOF'
+import struct, sys
+from pathlib import Path
+d = Path(sys.argv[1])
+header_size = 72 + 2 * (4 + 8 * 62)
+header = bytearray((d / 'db.kdb').read_bytes()[:header_size])
+struct.pack_into('<Q', header, 48, 0)
+(d / 'empty.kdb').write_bytes(header)
+(d / 'empty.idx').write_bytes(b'KRAKIX2' + bytes([10]) + bytes(8 * ((1 << 20) + 1)))
+PYEOF
+    gzip -c "$D/batch.fq" > "$D/batch.fq.gz"
+    mkdir "$D/tmp"
+    common=(-d "$D/empty.kdb" -i "$D/empty.idx" -d "$D/db.kdbc" -i "$D/db.idxc"
+            -d "$D/conflict.kdb" -i "$D/db.idx" -a "$D/taxDB" -t 1 -u 5000 -B 6000)
+    for executable in classify classifyExact; do
+      [ -x "$SRC/$executable" ] || continue
+      "$SRC/$executable" "${common[@]}" -o "$D/multi-baseline.out" -r "$D/multi-baseline.report" \
+        -C "$D/multi-baseline.classified" -U "$D/multi-baseline.unclassified" \
+        "$D/batch.fa" "$D/batch.fq.gz" "$D/no-pending.fa" 2>/dev/null
+      TMPDIR="$D/tmp" OMP_DYNAMIC=TRUE KRAKEN_BATCH_FORCE_HINTS=1 \
+        "$SRC/$executable" "${common[@]}" -t "${threads[-1]}" -D \
+        -o "$D/multi-outer.out" -r "$D/multi-outer.report" -C "$D/multi-outer.classified" \
+        -U "$D/multi-outer.unclassified" "$D/batch.fa" "$D/batch.fq.gz" "$D/no-pending.fa" 2>"$D/multi-outer.log"
+      [ "$(grep -c '^Database-outer pass ' "$D/multi-outer.log")" -eq 3 ]
+      for result in out report classified unclassified; do
+        cmp "$D/multi-baseline.$result" "$D/multi-outer.$result"
+      done
+      rm "$D/multi-baseline.report" "$D/multi-outer.report"
+      [ -z "$(ls -A "$D/tmp")" ]
+    done
+    # A found zero taxid must not fall through to a later conflicting database.
+    python3 - "$D/conflict.kdb" "$D/zero.kdb" <<'PYEOF'
+import struct, sys
+data = bytearray(open(sys.argv[1], 'rb').read())
+header = 72 + 2 * (4 + 8 * 62)
+for pos in range(header + 8, len(data), 12):
+    struct.pack_into('<I', data, pos, 0)
+open(sys.argv[2], 'wb').write(data)
+PYEOF
+    zero=(-d "$D/zero.kdb" -i "$D/db.idx" -d "$D/conflict.kdb" -i "$D/db.idx"
+          -a "$D/taxDB" -t 1 -u 5000 -B 6000 -r off)
+    "$SRC/classify" "${zero[@]}" -o "$D/zero-batch.out" "$D/batch.fa" 2>/dev/null
+    "$SRC/classify" "${zero[@]}" -D -o "$D/zero-outer.out" "$D/batch.fa" 2>/dev/null
+    cmp "$D/zero-batch.out" "$D/zero-outer.out"
+    "$SRC/classify" "${common[@]}" -D -r off -o "$D/no-pending.out" \
+      "$D/no-pending.fa" 2>"$D/no-pending.log"
+    if grep -q 'Database-outer pass 2' "$D/no-pending.log"; then
+      echo "database-outer mode continued after all queries were resolved"; exit 1
+    fi
+    for invalid in '-q' '-x 1M' '-x 0' '-B 0'; do
+      if "$SRC/classify" "${common[@]}" -D $invalid "$D/batch.fa" 2>"$D/outer-invalid.err"; then
+        echo "database-outer mode accepted incompatible $invalid"; exit 1
+      fi
+      grep -q "database-outer mode requires batching" "$D/outer-invalid.err"
+    done
+    if TMPDIR="$D/no-such-directory" "$SRC/classify" "${common[@]}" -D "$D/batch.fa" 2>"$D/outer-tmp.err"; then
+      echo "database-outer mode accepted an invalid TMPDIR"; exit 1
+    fi
+    grep -q "creating database-outer temporary file" "$D/outer-tmp.err"
+    mkdir "$D/install" "$D/wrapper-db"
+    cp "$TESTS/../scripts/krakenuniq" "$TESTS/../scripts/krakenlib.pm" \
+      "$TESTS/../scripts/read_merger.pl" "$D/install/"
+    ln -s "$SRC/classify" "$D/install/classify"
+    ln -s "$D/db.kdbc" "$D/wrapper-db/database.kdb"
+    ln -s "$D/db.idxc" "$D/wrapper-db/database.idx"
+    ln -s "$D/taxDB" "$D/wrapper-db/taxDB"
+    for strategy in batch outer; do
+      outer=()
+      if [ "$strategy" = outer ]; then outer=(--database-outer); fi
+      "$D/install/krakenuniq" --db "$D/wrapper-db" --batch-size 6000 "${outer[@]}" \
+        --output "$D/wrapper-$strategy.out" --report-file "$D/wrapper-$strategy.report" \
+        "$D/batch.fa" 2>/dev/null
+      grep -v '^#' "$D/wrapper-$strategy.report" > "$D/wrapper-$strategy.data"
+    done
+    cmp "$D/wrapper-batch.out" "$D/wrapper-outer.out"
+    cmp "$D/wrapper-batch.data" "$D/wrapper-outer.data"
+    "$D/install/krakenuniq" --db "$D/wrapper-db" --database-outer \
+      --output "$D/wrapper-default.out" --report-file "$D/wrapper-default.report" \
+      "$D/batch.fa" 2>/dev/null
+    cmp "$D/wrapper-batch.out" "$D/wrapper-default.out"
+    for strategy in batch outer; do
+      outer=()
+      if [ "$strategy" = outer ]; then outer=(--database-outer); fi
+      "$D/install/krakenuniq" --db "$D/wrapper-db" --batch-size 6000 "${outer[@]}" \
+        --paired --output "$D/paired-$strategy.out" --report-file "$D/paired-$strategy.report" \
+        "$D/batch.fq" "$D/batch.fq" 2>/dev/null
+      grep -v '^#' "$D/paired-$strategy.report" > "$D/paired-$strategy.data"
+    done
+    cmp "$D/paired-batch.out" "$D/paired-outer.out"
+    cmp "$D/paired-batch.data" "$D/paired-outer.data"
+    echo "database-outer output matches batching for multiple input files"
     if "$SRC/classify" -B nonsense 2>"$D/invalid.err"; then
       echo "invalid batch size accepted"; exit 1
     fi
@@ -130,11 +226,15 @@ PYEOF
       for mode in sorted unsorted; do
         hint=()
         if [ "$mode" = unsorted ]; then hint=(-H); fi
-        KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" -d "$D/db.kdbc" -i "$D/db.idxc" \
-          -d "$D/wide.kdb" -i "$D/wide.idx" -d "$D/db.kdbc" -i "$D/db.idxc" \
-          -a "$D/taxDB" -t "${threads[-1]}" -B 1M "${hint[@]}" -r off \
-          -o "$D/wide.out" "$D/wide.fa" 2>/dev/null
-        cmp "$D/wide.expected" "$D/wide.out"
+        for strategy in batched outer; do
+          outer=()
+          if [ "$strategy" = outer ]; then outer=(-D); fi
+          KRAKEN_BATCH_FORCE_HINTS=1 "$SRC/classify" -d "$D/db.kdbc" -i "$D/db.idxc" \
+            -d "$D/wide.kdb" -i "$D/wide.idx" -d "$D/db.kdbc" -i "$D/db.idxc" \
+            -a "$D/taxDB" -t "${threads[-1]}" -B 1M "${hint[@]}" "${outer[@]}" -r off \
+            -o "$D/wide.out" "$D/wide.fa" 2>/dev/null
+          cmp "$D/wide.expected" "$D/wide.out"
+        done
       done
       echo "wide legacy index and mixed-width databases match expected output"
     fi

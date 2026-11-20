@@ -80,6 +80,7 @@ bool finish_classification(DNASequence &dna, const vector<uint32_t> &taxa,
                            ostringstream &coss, ostringstream &uoss,
                            unordered_map<uint32_t, READCOUNTS>& my_taxon_counts);
 void process_file_batched(char *filename);
+void process_files_database_outer(int count, char **filenames);
 inline void print_sequence(ostream* oss_ptr, const DNASequence& dna);
 string hitlist_string(const vector<uint32_t> &taxa, const vector<char>& ambig_list);
 
@@ -100,6 +101,7 @@ bool Print_kraken = true;
 bool Print_kraken_report = false;
 bool Populate_memory = false;
 uint64_t Populate_memory_size = 0;
+bool Chunk_preload_requested = false;
 bool Only_classified_kraken_output = false;
 bool Print_sequence = false;
 bool Print_Progress = true;
@@ -123,6 +125,7 @@ vector<ogzstream*> Open_gzstreams;
 size_t Work_unit_size = DEF_WORK_UNIT_SIZE;
 size_t Batch_size = DEF_BATCH_SIZE;  // bp per batch of reads; 0 = classify read by read
 bool Page_hints = true;
+bool Database_outer = false;
 // Mapped DB/index files (address, size), filled in by main()
 static vector<std::pair<const char *, size_t> > Db_maps, Idx_maps;
 TaxonomyDB<uint32_t> taxdb;
@@ -269,14 +272,17 @@ int main(int argc, char **argv) {
 
   struct timeval tv1, tv2;
   gettimeofday(&tv1, NULL);
-  for (int i = optind; i < argc; i++) {
-    if (Populate_memory && Populate_memory_size > 0)
-      process_file_with_db_chunk(argv[i]);
-    else if (Batch_size > 0 && !Quick_mode)
-      process_file_batched(argv[i]);
-    else
-      process_file(argv[i]);
-  }
+  if (Database_outer)
+    process_files_database_outer(argc - optind, argv + optind);
+  else
+    for (int i = optind; i < argc; i++) {
+      if (Populate_memory && Populate_memory_size > 0)
+        process_file_with_db_chunk(argv[i]);
+      else if (Batch_size > 0 && !Quick_mode)
+        process_file_batched(argv[i]);
+      else
+        process_file(argv[i]);
+    }
   gettimeofday(&tv2, NULL);
 
   report_stats(tv1, tv2);
@@ -616,6 +622,104 @@ inline bool batch_query_less(const BatchQuery<Bin> &a, const BatchQuery<Bin> &b)
 
 enum : uint8_t { KM_PENDING = 0, KM_AMBIG = 1, KM_RESOLVED = 2 };
 
+void temp_read(FILE *file, void *data, size_t size) {
+  if (size && fread(data, 1, size, file) != size) {
+    if (ferror(file))
+      err(EX_IOERR, "reading database-outer temporary file");
+    errx(EX_IOERR, "truncated database-outer temporary file");
+  }
+}
+
+void temp_write(FILE *file, const void *data, size_t size) {
+  if (size && fwrite(data, 1, size, file) != size)
+    err(EX_IOERR, "writing database-outer temporary file");
+}
+
+off_t temp_position(FILE *file) {
+  off_t pos = ftello(file);
+  if (pos < 0)
+    err(EX_IOERR, "locating database-outer temporary file");
+  return pos;
+}
+
+void temp_seek(FILE *file, off_t pos) {
+  if (fseeko(file, pos, SEEK_SET) != 0)
+    err(EX_IOERR, "seeking database-outer temporary file");
+}
+
+class OuterTempFile {
+ public:
+  OuterTempFile() {
+    const char *dir = getenv("TMPDIR");
+    string path = (dir && *dir ? dir : "/tmp");
+    path += "/krakenuniq-outer-XXXXXX";
+    vector<char> name(path.begin(), path.end());
+    name.push_back('\0');
+    int fd = mkstemp(name.data());
+    if (fd < 0)
+      err(EX_CANTCREAT, "creating database-outer temporary file in %s", dir && *dir ? dir : "/tmp");
+    if (unlink(name.data()) != 0)
+      err(EX_IOERR, "unlinking database-outer temporary file %s", name.data());
+    file_ = fdopen(fd, "w+b");
+    if (!file_)
+      err(EX_OSERR, "opening database-outer temporary file");
+  }
+  ~OuterTempFile() { fclose(file_); }
+  FILE *get() const { return file_; }
+
+ private:
+  OuterTempFile(const OuterTempFile &) = delete;
+  OuterTempFile &operator=(const OuterTempFile &) = delete;
+  FILE *file_;
+};
+
+void spool_sequence(FILE *file, const DNASequence &dna) {
+  const string *fields[] = {&dna.id, &dna.header_line, &dna.seq, &dna.quals};
+  uint64_t sizes[4];
+  for (size_t i = 0; i < 4; ++i)
+    sizes[i] = fields[i]->size();
+  temp_write(file, sizes, sizeof(sizes));
+  for (const string *field : fields)
+    temp_write(file, field->data(), field->size());
+}
+
+class SpoolReader : public DNASequenceReader {
+ public:
+  SpoolReader(FILE *file, off_t end) : file_(file), pos_(temp_position(file)), end_(end), valid_(true) {}
+  DNASequence next_sequence() override {
+    DNASequence dna;
+    if (pos_ == end_) {
+      valid_ = false;
+      return dna;
+    }
+    if (pos_ > end_)
+      errx(EX_IOERR, "invalid database-outer input spool position");
+    uint64_t sizes[4];
+    if (end_ - pos_ < (off_t)sizeof(sizes))
+      errx(EX_IOERR, "truncated database-outer input spool");
+    temp_read(file_, sizes, sizeof(sizes));
+    pos_ += sizeof(sizes);
+    string *fields[] = {&dna.id, &dna.header_line, &dna.seq, &dna.quals};
+    for (size_t i = 0; i < 4; ++i) {
+      string *field = fields[i];
+      if (sizes[i] > field->max_size() || sizes[i] > (uint64_t)(end_ - pos_))
+        errx(EX_IOERR, "invalid database-outer input spool record");
+      field->resize(sizes[i]);
+      if (sizes[i])
+        temp_read(file_, &(*field)[0], sizes[i]);
+      pos_ += sizes[i];
+    }
+    return dna;
+  }
+  bool is_valid() override { return valid_; }
+
+ private:
+  FILE *file_;
+  off_t pos_;
+  off_t end_;
+  bool valid_;
+};
+
 const size_t PF_DIST_INDEX = 32;     // queries ahead: prefetch index cache line
 const size_t PF_DIST_DATA = 16;      // queries ahead: prefetch DB cache lines
 const size_t HINT_DIST_INDEX = 1024; // queries ahead: page-in hint for index
@@ -788,17 +892,10 @@ bool lookup_batch_database(size_t db_id, const vector<uint64_t> &kmers,
 
 } // namespace
 
-void process_file_batched(char *filename) {
-  string file_str(filename);
-  DNASequenceReader *reader;
-  Fastq_input = determine_input_file_type(filename);
-  if (Fastq_input)
-    reader = new FastqReader(file_str);
-  else
-    reader = new FastaReader(file_str);
-
+bool process_batched_pass(DNASequenceReader *reader, size_t first_db, size_t end_db,
+                          bool emit_output, FILE *spool, FILE *state_file,
+                          bool load_state) {
   const size_t k = KrakenDatabases[0]->get_k();
-  const size_t n_dbs = KrakenDatabases.size();
   vector<size_t> unit_start;
 
   vector<DNASequence> reads;
@@ -813,6 +910,7 @@ void process_file_batched(char *filename) {
   #endif
   vector<BatchQuery<uint32_t> > qs;
   vector<BatchQuery<uint64_t> > wide_qs;
+  bool queried = false;
 
   while (reader->is_valid()) {
     reads.clear();
@@ -828,6 +926,8 @@ void process_file_batched(char *filename) {
         if (!reader->is_valid())
           break;
         unit_nt += dna.seq.size();
+        if (spool)
+          spool_sequence(spool, dna);
         reads.push_back(std::move(dna));
       }
       if (reads.size() == first)
@@ -875,8 +975,16 @@ void process_file_batched(char *filename) {
       for (size_t i = cnt[r]; i < off[r + 1] - off[r]; ++i)
         state[off[r] + i] = KM_AMBIG;
 
+    off_t state_pos = 0;
+    if (load_state) {
+      // Replaying the same work units keeps the temporary state blocks aligned.
+      state_pos = temp_position(state_file);
+      temp_read(state_file, taxa.data(), taxa.size() * sizeof(taxa[0]));
+      temp_read(state_file, state.data(), state.size() * sizeof(state[0]));
+    }
+
     // Phase 2: look up pending k-mers, one database at a time
-    for (size_t d = 0; d < n_dbs; ++d) {
+    for (size_t d = first_db; d < end_db; ++d) {
       bool pending;
       if (KrakenDatabases[d]->get_index()->indexed_nt() <= 16) {
         vector<BatchQuery<uint64_t> >().swap(wide_qs);
@@ -887,6 +995,17 @@ void process_file_batched(char *filename) {
       }
       if (!pending)
         break;
+      queried = true;
+    }
+
+    if (!emit_output) {
+      if (load_state)
+        temp_seek(state_file, state_pos);
+      temp_write(state_file, taxa.data(), taxa.size() * sizeof(taxa[0]));
+      temp_write(state_file, state.data(), state.size() * sizeof(state[0]));
+      // An update stream must be repositioned between writes and later reads.
+      temp_seek(state_file, temp_position(state_file));
+      continue;
     }
 
     // Phase 3: per-read classification, output in input order
@@ -961,8 +1080,66 @@ void process_file_batched(char *filename) {
       fprintf(stderr, "\r Processed %llu sequences (%.2f%% classified)",
               total_sequences, total_classified * 100.0 / total_sequences);
   }
+  return queried;
+}
 
+DNASequenceReader *open_batched_reader(char *filename) {
+  Fastq_input = determine_input_file_type(filename);
+  if (Fastq_input)
+    return new FastqReader(filename);
+  return new FastaReader(filename);
+}
+
+void process_file_batched(char *filename) {
+  DNASequenceReader *reader = open_batched_reader(filename);
+  process_batched_pass(reader, 0, KrakenDatabases.size(), true, NULL, NULL, false);
   delete reader;
+}
+
+void process_files_database_outer(int count, char **filenames) {
+  struct InputSpan {
+    off_t spool_start, spool_end, state_start, state_end;
+    bool fastq;
+  };
+  vector<InputSpan> inputs(count);
+  OuterTempFile spool, state;
+
+  for (size_t d = 0; d < KrakenDatabases.size(); ++d) {
+    cerr << "Database-outer pass " << d + 1 << " of " << KrakenDatabases.size() << endl;
+    bool queried = false;
+    for (int i = 0; i < count; ++i) {
+      if (d == 0) {
+        DNASequenceReader *reader = open_batched_reader(filenames[i]);
+        inputs[i].fastq = Fastq_input;
+        inputs[i].spool_start = temp_position(spool.get());
+        inputs[i].state_start = temp_position(state.get());
+        queried |= process_batched_pass(reader, d, d + 1, false, spool.get(), state.get(), false);
+        delete reader;
+        inputs[i].spool_end = temp_position(spool.get());
+        inputs[i].state_end = temp_position(state.get());
+      } else {
+        Fastq_input = inputs[i].fastq;
+        temp_seek(spool.get(), inputs[i].spool_start);
+        temp_seek(state.get(), inputs[i].state_start);
+        SpoolReader reader(spool.get(), inputs[i].spool_end);
+        queried |= process_batched_pass(&reader, d, d + 1, false, NULL, state.get(), true);
+        if (temp_position(state.get()) != inputs[i].state_end)
+          errx(EX_IOERR, "database-outer state length changed between passes");
+      }
+    }
+    if (!queried)
+      break;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    Fastq_input = inputs[i].fastq;
+    temp_seek(spool.get(), inputs[i].spool_start);
+    temp_seek(state.get(), inputs[i].state_start);
+    SpoolReader reader(spool.get(), inputs[i].spool_end);
+    process_batched_pass(&reader, 0, 0, true, NULL, state.get(), true);
+    if (temp_position(state.get()) != inputs[i].state_end)
+      errx(EX_IOERR, "database-outer state length changed during output");
+  }
 }
 
 void process_file_with_db_chunk(char *filename) {
@@ -1484,7 +1661,7 @@ void parse_command_line(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "-h") == 0)
     usage(0);
-  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qcC:U:Ma:r:sI:p:x:B:H")) != -1) {
+  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qcC:U:Ma:r:sI:p:x:B:HD")) != -1) {
     switch (opt) {
       case 'd' :
         DB_filenames.push_back(optarg);
@@ -1549,6 +1726,7 @@ void parse_command_line(int argc, char **argv) {
         break;
       case 'x' :
         Populate_memory = true;
+        Chunk_preload_requested = true;
         Populate_memory_size = parse_human_readable_size(optarg); // strtoull(optarg, NULL, 0);
         break;
       case 'B' :
@@ -1568,6 +1746,9 @@ void parse_command_line(int argc, char **argv) {
       case 'H' :
         Page_hints = false;
         break;
+      case 'D' :
+        Database_outer = true;
+        break;
       case 'I' :
         UID_to_TaxID_map_filename = optarg;
         Map_UIDs = true;
@@ -1586,6 +1767,10 @@ void parse_command_line(int argc, char **argv) {
     cerr << "Missing mandatory option -i" << endl;
     usage();
   }
+  if (Database_outer && (Quick_mode || Chunk_preload_requested || Batch_size == 0))
+    errx(EX_USAGE, "database-outer mode requires batching and cannot be used with quick mode or chunked preloading");
+  if (Database_outer && optind == argc)
+    errx(EX_USAGE, "database-outer mode requires an input file");
   if (optind == argc && !Populate_memory) {
     cerr << "No sequence data files specified" << endl;
   }
@@ -1612,6 +1797,7 @@ void usage(int exit_code) {
        << "  -M               Preload database files" << endl
        << "  -x size          Preload database files using x amount of RAM (e.g. 10G)" << endl
        << "  -B size          Look up k-mers in batches of reads totalling this many bp (default 16M, 0 = read by read)" << endl
+       << "  -D               Search all input blocks against each database before moving to the next" << endl
        << "  -H               Don't sort k-mers and issue paging hints for out-of-cache databases (batch mode)" << endl
        << "  -s               Print read sequence in Kraken output" << endl
        << "  -h               Print this message" << endl

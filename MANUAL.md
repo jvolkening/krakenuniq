@@ -53,9 +53,27 @@ sorting, and retained buffer capacity require additional memory. When invoking
 `classify` directly, use `-B SIZE` to change the target (for example, `-B 4M`), or `-B 0` to use
 the original per-read lookup. The `K`, `M`, and `G` suffixes are binary.
 `-H` disables sorting and explicit paging hints, but retains batching and
-CPU cache prefetching. Quick mode (`-q`) and chunked preloading (`-x`) use
-the original lookup paths. These options are currently specific to `classify`,
-not the `krakenuniq` wrapper.
+CPU cache prefetching; it is specific to `classify`. Quick mode (`-q`) and
+chunked preloading (`-x`) use the original lookup paths.
+
+For inputs that would otherwise span multiple batches, `krakenuniq
+--database-outer` (`classify -D`) searches all input blocks against each
+database before moving to the next. It stages the input once and stores
+per-k-mer results in temporary files, then rereads the staged input to produce
+the normal output. This can improve database page-cache reuse, but does not
+guarantee a single physical disk traversal. The mode trades additional
+temporary-file I/O and repeated k-mer extraction for that reuse.
+
+Temporary files are created in `$TMPDIR`, or `/tmp` if it is unset, and
+unlinked immediately. Allow space for the uncompressed input records and about
+five bytes per possible k-mer position, plus stored identifiers, per-record
+metadata, and filesystem overhead. A memory-backed
+temporary directory consumes RAM and competes with the database cache. The
+existing `--batch-size` (`-B`) controls working-block memory in this mode and
+defaults to 16M in `krakenuniq`; it does not change the database-outer ordering.
+Database-outer mode cannot be combined with quick mode, chunked preloading, or
+a zero batch size. `--preload` still preloads all databases, which may exceed
+available memory.
 
 
 Storing strain genomes with assembly project and sequence accessions
